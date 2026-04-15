@@ -111,8 +111,8 @@ async def lookup_apn(
 
     report = APNReport(
         apn=request.apn,
-        county=county,
-        state=state,
+        county=parcel.get("county") or county,
+        state=parcel.get("state") or state,
         acreage=parcel.get("acreage"),
         assessed_value=market_val.get("mid_estimated_value"),
         status="completed",

@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import engine, Base, SessionLocal
-from routers import auth, apn, csv_upload
+from routers import auth, apn, csv_upload, chat
 from models.user import User
 from models.parcel_data import ParcelData  # noqa: F401 — ensure table creation
 from utils.auth import hash_password
@@ -58,6 +58,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(apn.router)
 app.include_router(csv_upload.router)
+app.include_router(chat.router)
 
 
 @app.get("/")

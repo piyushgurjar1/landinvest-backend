@@ -10,22 +10,32 @@ from typing import Any, Optional
 from schemas.report import ParcelReport
 
 from gemini_models import (
-    Stage1Core,
+    Stage1Identity,
+    Stage1Zoning,
     Stage1Utilities,
+    Stage1Environment,
     Stage2Raw,
     RawSoldComp,
     RawActiveListing,
 )
 from gemini_prompts import (
-    STAGE1_CORE_PROMPT,
-    STAGE1_UTILITIES_PROMPT,
+    STAGE1A_IDENTITY_PROMPT,
+    STAGE1B_ZONING_PROMPT,
+    STAGE1C_UTILITIES_PROMPT,
+    STAGE1D_ENVIRONMENT_PROMPT,
     STAGE2_PROMPT,
-    THINKING_STAGE1_CORE,
-    THINKING_STAGE1_UTIL,
+    THINKING_STAGE1A,
+    THINKING_STAGE1B,
+    THINKING_STAGE1C,
+    THINKING_STAGE1D,
     THINKING_STAGE2,
     generate_structured,
 )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scalar helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _to_int(v: Any) -> Optional[int]:
     if v is None or v == "":
@@ -182,88 +192,139 @@ def _yes_no_unknown_to_bool(status: str) -> Optional[bool]:
     return None
 
 
-def _merged_stage1(core: Stage1Core, util: Stage1Utilities) -> dict[str, Any]:
-    maps_link, sat_link, street_link = _build_maps_links(core.gps_coordinates)
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage merger — combines outputs of all 4 Stage-1 calls into one flat dict
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _merged_all_stages(
+    identity: Stage1Identity,
+    zoning: Stage1Zoning,
+    utilities: Stage1Utilities,
+    environment: Stage1Environment,
+    maps_link: Optional[str],
+    sat_link: Optional[str],
+    street_link: Optional[str],
+) -> dict[str, Any]:
     return {
-        "apn": core.apn,
-        "county": core.county,
-        "state": core.state,
-        "street_address": core.street_address,
-        "gps_coordinates": core.gps_coordinates,
-        "google_maps_link": core.google_maps_link or maps_link,
-        "google_satellite_link": core.google_satellite_link or sat_link,
-        "google_street_view_link": core.google_street_view_link or street_link,
-        "parcel_boundary_map_link": core.parcel_boundary_map_link,
-        "acreage": core.acreage,
-        "sq_ft": core.sq_ft or (int(round((core.acreage or 0) * 43560)) if core.acreage else 0),
-        "legal_description": core.legal_description,
-        "county_assessed_value": core.county_assessed_value,
-        "assessed_year": core.assessed_year,
-        "owner_name": core.owner_name,
-        "tax_status": core.tax_status,
-        "liens_beyond_tax": core.liens_beyond_tax,
-        "distance_to_nearest_city": core.distance_to_nearest_city,
-        "nearest_city_name": core.nearest_city_name,
-        "distance_to_highway": core.distance_to_highway,
-        "distance_to_lake_or_water": core.distance_to_lake_or_water,
-        "distance_to_major_attraction": core.distance_to_major_attraction,
-        "nearby_housing_development": core.nearby_housing_development,
-        "population_growth_trend": core.population_growth_trend,
-        "county_growth_rate": core.county_growth_rate,
-        "building_permit_growth": core.building_permit_growth,
-        "road_type": core.road_type,
-        "legal_access_status": core.legal_access_status,
-        "road_description": core.road_description,
-        "easements": core.easements,
-        "landlocked": core.landlocked,
-        "power_lines_visible": core.power_lines_visible,
-        "nearby_structures": core.nearby_structures,
-        "zoning_code": core.zoning_code,
-        "zoning_description": core.zoning_description,
-        "buildable": core.buildable,
-        "minimum_lot_size": core.minimum_lot_size,
-        "residential_allowed": core.residential_allowed,
-        "mobile_homes_allowed": core.mobile_homes_allowed,
-        "rv_allowed": core.rv_allowed,
-        "tiny_homes_allowed": core.tiny_homes_allowed,
-        "camping_allowed": core.camping_allowed,
-        "off_grid_allowed": core.off_grid_allowed,
-        "hoa_present": core.hoa_present,
-        "hoa_fees": core.hoa_fees,
-        "allowed_uses": core.allowed_uses,
-        "electricity_available": _utility_status_to_bool(util.electricity.status),
-        "water_available": _utility_status_to_bool(util.water.status),
-        "sewer_available": _utility_status_to_bool(util.sewer.status),
-        "gas_available": _utility_status_to_bool(util.gas.status),
-        "well_required": _yes_no_unknown_to_bool(util.well_required.status),
-        "septic_required": _yes_no_unknown_to_bool(util.septic_required.status),
-        "utility_at_street": _yes_no_unknown_to_bool(util.utility_at_street.status),
-        "utility_cost_estimate": util.utility_cost_estimate,
-        "flood_zone": core.flood_zone,
-        "flood_zone_designation": core.flood_zone_designation,
-        "wetlands_risk": core.wetlands_risk,
-        "terrain_description": core.terrain_description,
-        "slope_classification": core.slope_classification,
-        "washes_or_arroyos": core.washes_or_arroyos,
-        "landslide_risk": core.landslide_risk,
-        "fire_risk": core.fire_risk,
-        "soil_suitability": core.soil_suitability,
-        "protected_land_status": core.protected_land_status,
-        "environmental_restrictions": core.environmental_restrictions,
-        "nearby_parcel_usage": core.nearby_parcel_usage,
-        "utility_evidence": util.model_dump(),
+        # ── Identity (1A) ────────────────────────────────────────────────────
+        "apn": identity.apn,
+        "county": identity.county,
+        "state": identity.state,
+        "street_address": identity.street_address,
+        "gps_coordinates": identity.gps_coordinates,
+        "google_maps_link": identity.google_maps_link or maps_link,
+        "google_satellite_link": identity.google_satellite_link or sat_link,
+        "google_street_view_link": identity.google_street_view_link or street_link,
+        "parcel_boundary_map_link": identity.parcel_boundary_map_link,
+        "acreage": identity.acreage,
+        "sq_ft": identity.sq_ft or (
+            int(round((identity.acreage or 0) * 43560)) if identity.acreage else 0
+        ),
+        "legal_description": identity.legal_description,
+        "county_assessed_value": identity.county_assessed_value,
+        "assessed_year": identity.assessed_year,
+        "owner_name": identity.owner_name,
+        "tax_status": identity.tax_status,
+        "liens_beyond_tax": identity.liens_beyond_tax,
+
+        # ── Zoning (1B) ──────────────────────────────────────────────────────
+        "zoning_code": zoning.zoning_code,
+        "zoning_description": zoning.zoning_description,
+        "allowed_uses": zoning.allowed_uses,
+        "minimum_lot_size": zoning.minimum_lot_size,
+        "setbacks": zoning.setbacks,
+        "buildable": _yes_no_unknown_to_bool(zoning.buildable),
+        "residential_allowed": _yes_no_unknown_to_bool(zoning.residential_allowed),
+        "mobile_homes_allowed": _yes_no_unknown_to_bool(zoning.mobile_homes_allowed),
+        "rv_allowed": _yes_no_unknown_to_bool(zoning.rv_allowed),
+        "tiny_homes_allowed": _yes_no_unknown_to_bool(zoning.tiny_homes_allowed),
+        "camping_allowed": _yes_no_unknown_to_bool(zoning.camping_allowed),
+        "off_grid_allowed": _yes_no_unknown_to_bool(zoning.off_grid_allowed),
+        "commercial_allowed": _yes_no_unknown_to_bool(zoning.commercial_allowed),
+        "agricultural_allowed": _yes_no_unknown_to_bool(zoning.agricultural_allowed),
+        "hoa_present": _yes_no_unknown_to_bool(zoning.hoa_present),
+        "hoa_fees": zoning.hoa_fees,
+        "hoa_name": zoning.hoa_name,
+        "planning_dept_phone": zoning.planning_dept_phone,
+        "zoning_source_url": zoning.zoning_source_url,
+
+        # ── Utilities & Infrastructure (1C) ──────────────────────────────────
+        "electricity_available": _utility_status_to_bool(utilities.electricity.status),
+        "water_available": _utility_status_to_bool(utilities.water.status),
+        "sewer_available": _utility_status_to_bool(utilities.sewer.status),
+        "gas_available": _utility_status_to_bool(utilities.gas.status),
+        "well_required": _yes_no_unknown_to_bool(utilities.well_required.status),
+        "septic_required": _yes_no_unknown_to_bool(utilities.septic_required.status),
+        "utility_at_street": _yes_no_unknown_to_bool(utilities.utility_at_street.status),
+        "utility_cost_estimate": utilities.utility_cost_estimate,
+        "internet_provider": utilities.internet_provider,
+        "internet_type": utilities.internet_type,
+        "cell_coverage": utilities.cell_coverage,
+        "cell_carriers": utilities.cell_carriers,
+        "road_type": utilities.road_type,
+        "road_name": utilities.road_name,
+        "road_condition": utilities.road_condition,
+        "road_maintained_by": utilities.road_maintained_by,
+        "year_round_access": utilities.year_round_access,
+        "distance_to_paved_road": utilities.distance_to_paved_road,
+        "utility_evidence": utilities.model_dump(),
+
+        # ── Environment, terrain & growth (1D) ───────────────────────────────
+        "flood_zone": environment.flood_zone,
+        "flood_zone_designation": environment.flood_zone_designation,
+        "flood_map_url": environment.flood_map_url,
+        "wetlands_risk": environment.wetlands_risk,
+        "wetlands_notes": environment.wetlands_notes,
+        "fire_risk": environment.fire_risk,
+        "fire_risk_source": environment.fire_risk_source,
+        "fire_risk_url": environment.fire_risk_url,
+        "landslide_risk": environment.landslide_risk,
+        "terrain_description": environment.terrain_description,
+        "slope_classification": environment.slope_classification,
+        "washes_or_arroyos": environment.washes_or_arroyos,
+        "soil_suitability": environment.soil_suitability,
+        "protected_land_status": environment.protected_land_status,
+        "environmental_restrictions": environment.environmental_restrictions,
+        "nearest_city_name": environment.nearest_city_name,
+        "distance_to_nearest_city": environment.distance_to_nearest_city,
+        "distance_to_highway": environment.distance_to_highway,
+        "distance_to_lake_or_water": environment.distance_to_lake_or_water,
+        "distance_to_major_attraction": environment.distance_to_major_attraction,
+        "major_attraction_name": environment.major_attraction_name,
+        "nearby_parcel_usage": environment.nearby_parcel_usage,
+        "nearby_housing_development": environment.nearby_housing_development,
+        "nearby_structures": environment.nearby_structures,
+        "power_lines_visible": _yes_no_unknown_to_bool(environment.power_lines_visible),
+        "population_growth_trend": environment.population_growth_trend,
+        "county_growth_rate": environment.county_growth_rate,
+        "building_permit_growth": environment.building_permit_growth,
+        "growth_notes": environment.growth_notes,
+
+        # road/access fallbacks — use environment values if 1C didn't return them
+        "legal_access_status": None,   # 1C road section covers this via road_type
+        "road_description": None,
+        "easements": None,
+        "landlocked": None,
+
+        # ── All sources merged ────────────────────────────────────────────────
         "sources_used_stage1": _dedupe_keep_order(
-            core.sources_used_stage1_core + util.sources_used_stage1_utilities
+            identity.sources_used_stage1a
+            + zoning.sources_used_stage1b
+            + utilities.sources_used_stage1c
+            + environment.sources_used_stage1d
         ),
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comp / listing de-dupe helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _dedupe_comps(comps: list[RawSoldComp]) -> list[RawSoldComp]:
     seen = set()
     out = []
     for c in comps:
-        if not c.source_url or not c.acreage or not c.sold_price:
+        if not c.acreage or not c.sold_price:
             continue
         if c.acreage <= 0 or c.sold_price <= 0:
             continue
@@ -287,7 +348,7 @@ def _dedupe_listings(rows: list[RawActiveListing]) -> list[RawActiveListing]:
     seen = set()
     out = []
     for r in rows:
-        if not r.source_url or not r.acreage or not r.listing_price:
+        if not r.acreage or not r.listing_price:
             continue
         if r.acreage <= 0 or r.listing_price <= 0:
             continue
@@ -306,10 +367,16 @@ def _dedupe_listings(rows: list[RawActiveListing]) -> list[RawActiveListing]:
     return out
 
 
-def _filter_outliers_by_median_band(values: list[int], lower_mult: float, upper_mult: float) -> tuple[int, float, float]:
+def _filter_outliers_by_median_band(
+    values: list[int], lower_mult: float, upper_mult: float
+) -> tuple[int, float, float]:
     med = _median_int(values)
     return med, med * lower_mult, med * upper_mult
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market data cleaner
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
     raw_comps = _dedupe_comps(stage2_raw.raw_sold_comps)
@@ -349,12 +416,17 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
                     "source_url": c.source_url,
                     "removal_reason": f"Price/acre outside strict median fence ({int(lower)} - {int(upper)})",
                 })
-        notes.append(f"Strict comp fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}")
+        notes.append(
+            f"Strict comp fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}"
+        )
 
         if len(strict_clean) < 3:
             med, lower, upper = _filter_outliers_by_median_band(vals, 0.30, 3.5)
             strict_clean = []
-            removed = [x for x in removed if x["removal_reason"] == "Has structures / not pure vacant land"]
+            removed = [
+                x for x in removed
+                if x["removal_reason"] == "Has structures / not pure vacant land"
+            ]
             for c in base_comps:
                 if lower <= c.price_per_acre <= upper:
                     strict_clean.append(c)
@@ -377,7 +449,9 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         if vals:
             med, lower, upper = _filter_outliers_by_median_band(vals, 0.40, 2.5)
             clean_listings = [r for r in raw_listings if lower <= r.price_per_acre <= upper]
-            notes.append(f"Listing fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}")
+            notes.append(
+                f"Listing fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}"
+            )
 
     sold_ppa = [c.price_per_acre for c in clean_comps if c.price_per_acre]
     active_ppa = [r.price_per_acre for r in clean_listings if r.price_per_acre]
@@ -410,13 +484,21 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
 
     if median_dom is None and sold_to_active is None:
         market_classification = "Unknown"
-    elif (median_dom is not None and median_dom > 180) or (sold_to_active is not None and sold_to_active < 0.2):
+    elif (median_dom is not None and median_dom > 180) or (
+        sold_to_active is not None and sold_to_active < 0.2
+    ):
         market_classification = "Very Slow"
-    elif (median_dom is not None and 120 <= median_dom <= 180) and (sold_to_active is not None and 0.2 <= sold_to_active < 0.4):
+    elif (median_dom is not None and 120 <= median_dom <= 180) and (
+        sold_to_active is not None and 0.2 <= sold_to_active < 0.4
+    ):
         market_classification = "Slow"
-    elif (median_dom is not None and 60 <= median_dom <= 120) and (sold_to_active is not None and 0.4 <= sold_to_active <= 0.8):
+    elif (median_dom is not None and 60 <= median_dom <= 120) and (
+        sold_to_active is not None and 0.4 <= sold_to_active <= 0.8
+    ):
         market_classification = "Normal"
-    elif (median_dom is not None and median_dom < 60) and (sold_to_active is not None and sold_to_active > 0.8):
+    elif (median_dom is not None and median_dom < 60) and (
+        sold_to_active is not None and sold_to_active > 0.8
+    ):
         market_classification = "Fast"
     else:
         market_classification = "Normal" if clean_comps else "Unknown"
@@ -432,7 +514,11 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
     zip_turnover_6 = (sales_6 / inventory * 100.0) if inventory else None
     zip_turnover_12 = (sales_12 / inventory * 100.0) if inventory else None
 
-    diff_pct = _relative_diff_pct(median_sold_ppa, avg_sold_ppa) if median_sold_ppa and avg_sold_ppa else 100.0
+    diff_pct = (
+        _relative_diff_pct(median_sold_ppa, avg_sold_ppa)
+        if median_sold_ppa and avg_sold_ppa
+        else 100.0
+    )
     if len(clean_comps) >= 6 and diff_pct <= 20:
         confidence = "High"
     elif len(clean_comps) >= 3 and diff_pct <= 40:
@@ -493,12 +579,19 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
             "zip_turnover_rate_12mo": _maybe_percent(zip_turnover_12),
             "market_classification": market_classification,
             "estimated_dom_range": dom_range_map[market_classification],
-            "market_notes": f"{len(clean_comps)} clean sold comps, {inventory} clean active listings, confidence={confidence}.",
+            "market_notes": (
+                f"{len(clean_comps)} clean sold comps, {inventory} clean active listings, "
+                f"confidence={confidence}."
+            ),
         },
         "data_confidence": confidence,
         "sources_used_stage2": stage2_raw.sources_used_stage2,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _liens_found(liens_beyond_tax: Optional[str]) -> bool:
     s = _norm_text(liens_beyond_tax)
@@ -567,35 +660,43 @@ def _risk_score(stage1: dict[str, Any], stage2b: dict[str, Any]) -> tuple[int, l
     return score, factors, explanation
 
 
-def _deal_score(stage1: dict[str, Any], stage2b: dict[str, Any], profit_margin_pct_num: float) -> tuple[int, list[str], str]:
+def _deal_score(
+    stage1: dict[str, Any], stage2b: dict[str, Any], profit_margin_pct_num: float
+) -> tuple[int, list[str], str]:
     factors = []
     total = 0
 
-    road = _norm_text(stage1.get("road_type"))
-    access = _norm_text(stage1.get("legal_access_status"))
+    # ── Location: 5 pts ──────────────────────────────────────────────────────
+    road   = _norm_text(stage1.get("road_type"))
+    access = _norm_text(stage1.get("legal_access_status") or stage1.get("road_condition") or "")
 
-    if ("paved" in road) and ("legal" in access or "confirmed" in access):
-        pts = 20
-        note = "Location: 20/20 — Paved road and legal access confirmed"
-    elif ("gravel" in road) and ("legal" in access or "confirmed" in access):
-        pts = 15
-        note = "Location: 15/20 — Gravel road and legal access confirmed"
-    elif ("dirt" in road) or ("unclear" in access) or ("unknown" in access):
-        pts = 10
-        note = "Location: 10/20 — Dirt road or access unclear"
+    if ("paved" in road) and ("legal" in access or "confirmed" in access or "good" in access):
+        pts  = 5
+        note = "Location: 5/5 — Paved road and legal access confirmed"
+    elif ("gravel" in road) and ("legal" in access or "confirmed" in access or "good" in access):
+        pts  = 4
+        note = "Location: 4/5 — Gravel road and legal access confirmed"
+    elif ("dirt" in road) or ("unclear" in access) or ("unknown" in access) or not road:
+        pts  = 2
+        note = "Location: 2/5 — Dirt road or access unclear"
     else:
-        pts = 2
-        note = "Location: 2/20 — Weak access signal"
+        pts  = 1
+        note = "Location: 1/5 — Weak access signal"
     total += pts
     factors.append(note)
 
+    # ── Market: 20 pts ───────────────────────────────────────────────────────
     market = stage2b["market_demand"].get("market_classification")
     market_pts_map = {"Fast": 20, "Normal": 15, "Slow": 8, "Very Slow": 3, "Unknown": 8}
     pts = market_pts_map.get(market, 8)
     total += pts
     factors.append(f"Market: {pts}/20 — {market or 'Unknown'} market")
 
-    util3 = sum(1 for k in ["electricity_available", "water_available", "sewer_available"] if stage1.get(k) is True)
+    # ── Utilities: 20 pts ────────────────────────────────────────────────────
+    util3 = sum(
+        1 for k in ["electricity_available", "water_available", "sewer_available"]
+        if stage1.get(k) is True
+    )
     if util3 == 3:
         pts = 20
     elif util3 == 2:
@@ -607,32 +708,33 @@ def _deal_score(stage1: dict[str, Any], stage2b: dict[str, Any], profit_margin_p
     total += pts
     factors.append(f"Utilities: {pts}/20 — {util3} of 3 core utilities confirmed")
 
+    # ── Profit: 50 pts ───────────────────────────────────────────────────────
     if profit_margin_pct_num > 200:
-        pts = 20
+        pts = 50
     elif 100 <= profit_margin_pct_num <= 200:
-        pts = 15
+        pts = 38
     elif 50 <= profit_margin_pct_num < 100:
-        pts = 10
+        pts = 25
     else:
-        pts = 5
+        pts = 10
     total += pts
-    factors.append(f"Profit: {pts}/20 — Expected margin {profit_margin_pct_num:.1f}%")
+    factors.append(f"Profit: {pts}/50 — Expected margin {profit_margin_pct_num:.1f}%")
 
+    # ── Risk: 5 pts ──────────────────────────────────────────────────────────
     risk_score_num, _, _ = _risk_score(stage1, stage2b)
     if 0 <= risk_score_num <= 19:
-        pts = 20
+        pts = 5
     elif 20 <= risk_score_num <= 39:
-        pts = 15
+        pts = 4
     elif 40 <= risk_score_num <= 59:
-        pts = 8
-    else:
         pts = 2
+    else:
+        pts = 0
     total += pts
-    factors.append(f"Risk: {pts}/20 — Risk score {risk_score_num}")
+    factors.append(f"Risk: {pts}/5 — Risk score {risk_score_num}")
 
-    explanation = "Deal score blends access, market speed, utilities, profit cushion, and risk."
+    explanation = "Deal score blends profit margin (50), market speed (20), utilities (20), access (5), and risk (5)."
     return total, factors, explanation
-
 
 def _verdict(score: int) -> str:
     if score >= 75:
@@ -654,13 +756,21 @@ def _risk_tier(risk_score_num: int) -> str:
     return "Extreme Risk"
 
 
-def _build_red_flags(stage1: dict[str, Any], stage2b: dict[str, Any], bidding_start_value: Optional[float], max_bid_ceiling: int) -> list[str]:
+def _build_red_flags(
+    stage1: dict[str, Any],
+    stage2b: dict[str, Any],
+    bidding_start_value: Optional[float],
+    max_bid_ceiling: int,
+) -> list[str]:
     flags = []
 
     if stage1.get("landlocked") is True:
         flags.append("Parcel appears landlocked")
-    if _norm_text(stage1.get("legal_access_status")) in {"unclear", "unknown", "not confirmed"}:
-        flags.append("Legal access is not clearly confirmed")
+
+    road = _norm_text(stage1.get("road_type") or "")
+    if not road or road in {"none", "unknown"}:
+        flags.append("Road type unknown or no road access found")
+
     if stage1.get("flood_zone") is True:
         flags.append(f"Flood zone: {stage1.get('flood_zone_designation') or 'confirmed'}")
     if stage1.get("wetlands_risk") is True:
@@ -685,19 +795,67 @@ def _build_red_flags(stage1: dict[str, Any], stage2b: dict[str, Any], bidding_st
         flags.append("Low comp confidence")
 
     if bidding_start_value is not None and bidding_start_value > max_bid_ceiling:
-        flags.append(f"Auction start {_money(bidding_start_value)} exceeds max bid ceiling {_money(max_bid_ceiling)}")
+        flags.append(
+            f"Auction start {_money(bidding_start_value)} exceeds max bid ceiling {_money(max_bid_ceiling)}"
+        )
 
     return flags
 
+
 def _next_learning_step(stage1: dict[str, Any], red_flags: list[str]) -> str:
-    if stage1.get("landlocked") is True or "Legal access is not clearly confirmed" in red_flags:
+    if stage1.get("landlocked") is True or "Road type unknown or no road access found" in red_flags:
         return "Order a title report and confirm deeded legal access or recorded easements before bidding."
     if any(stage1.get(k) is None for k in ["electricity_available", "water_available", "sewer_available"]):
-        return "Call the relevant utility providers or county planning office to confirm parcel-front utility service and extension cost."
+        return (
+            "Call the relevant utility providers or county planning office to confirm "
+            "parcel-front utility service and extension cost."
+        )
     if stage1.get("flood_zone") is True or stage1.get("wetlands_risk") is True:
         return "Review FEMA and wetlands maps with parcel boundary overlay before bidding."
     return "Order title, survey, and a basic access/utility verification package before placing a bid."
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic MLF + CF formula helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_mlf(market_classification: str) -> float:
+    """Market Liquidity Factor based on market speed."""
+    return {
+        "Fast": 0.90,
+        "Normal": 0.85,
+        "Slow": 0.80,
+        "Very Slow": 0.75,
+        "Unknown": 0.80,
+    }.get(market_classification, 0.80)
+
+
+def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
+    """
+    Dynamic Cost Factor.
+    Baseline 12% + risk adjustments:
+      +3% if both water AND electricity are unavailable/unknown
+      +3% if septic or well is required
+    """
+    cf = 0.12
+    adjustments: list[str] = []
+
+    water_avail = stage1.get("water_available")
+    elec_avail = stage1.get("electricity_available")
+    if water_avail is not True and elec_avail is not True:
+        cf += 0.03
+        adjustments.append("No water & electricity confirmed: +3%")
+
+    if stage1.get("septic_required") is True or stage1.get("well_required") is True:
+        cf += 0.03
+        adjustments.append("Septic/well required: +3%")
+
+    return cf, adjustments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report builder
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_report(
     stage1: dict[str, Any],
@@ -709,40 +867,77 @@ def _build_report(
     avg_sold_ppa = _to_int(stage2b.get("avg_sold_price_per_acre"))
     avg_active_ppa = _to_int(stage2b.get("avg_active_price_per_acre"))
 
+    # ── Core MMV ─────────────────────────────────────────────────────────────
     mmv = median_ppa * acreage
-    low_estimated_value = int(round(median_ppa * 0.85 * acreage))
-    mid_estimated_value = int(round(mmv))
+    low_estimated_value  = int(round(median_ppa * 0.85 * acreage))
+    mid_estimated_value  = int(round(mmv))
     high_estimated_value = int(round(median_ppa * 1.15 * acreage))
 
-    low_price_per_acre = int(round(median_ppa * 0.85))
-    mid_price_per_acre = int(round(median_ppa))
+    low_price_per_acre  = int(round(median_ppa * 0.85))
+    mid_price_per_acre  = int(round(median_ppa))
     high_price_per_acre = int(round(median_ppa * 1.15))
 
     clean_comp_count = stage2b.get("comps_after_filter", 0)
-    data_confidence = stage2b.get("data_confidence", "Low")
-    diff_pct = _relative_diff_pct(median_ppa, avg_sold_ppa or 0) if median_ppa and avg_sold_ppa else None
+    data_confidence  = stage2b.get("data_confidence", "Low")
+    diff_pct = (
+        _relative_diff_pct(median_ppa, avg_sold_ppa or 0)
+        if median_ppa and avg_sold_ppa else None
+    )
     valuation_notes = (
         f"Median sold price/acre {_money(median_ppa)}, average sold price/acre {_money(avg_sold_ppa)}, "
         f"using {clean_comp_count} clean comps; confidence={data_confidence}."
     )
     if diff_pct is not None and diff_pct > 30:
-        valuation_notes += f" Median vs average differs by {diff_pct:.1f}%, which suggests spread in comp quality."
+        valuation_notes += (
+            f" Median vs average differs by {diff_pct:.1f}%, which suggests spread in comp quality."
+        )
 
-    low_offer = int(round(mmv * 0.40))
-    high_offer = int(round(mmv * 0.65))
+    # ── Dynamic MLF + CF formula ──────────────────────────────────────────────
+    market_classification = stage2b["market_demand"].get("market_classification", "Unknown")
+    mlf = _compute_mlf(market_classification)
+    cf, cf_adjustments = _compute_cf(stage1)
+    pm = 0.40  # fixed profit margin target
 
-    conservative_resale = int(round(mmv * 0.80))
-    mid_resale = int(round(mmv * 0.90))
-    aggressive_resale = int(round(mmv * 0.95))
-    suggested_resale_price = mid_resale
-
-    max_bid_ceiling = int(round((0.90 / 1.40) * mmv))
+    # MAX_BID = MMV × MLF × (1 − PM − CF)
+    max_bid_ceiling   = int(round(mmv * mlf * (1 - pm - cf)))
     low_bid_threshold = int(round(max_bid_ceiling * 0.85))
     mid_bid_threshold = int(round(max_bid_ceiling * 0.925))
-    expected_profit = int(round(suggested_resale_price - max_bid_ceiling))
-    profit_margin_num = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
-    profit_margin_pct = f"{profit_margin_num:.1f}%"
 
+    # RESALE RANGE: Low = MLF−5%, Mid = MLF, High = MLF+3%
+    conservative_resale = int(round(mmv * (mlf - 0.05)))
+    mid_resale          = int(round(mmv * mlf))
+    aggressive_resale   = int(round(mmv * (mlf + 0.03)))
+    suggested_resale_price = mid_resale
+
+    # Profit metrics
+    expected_profit    = int(round(suggested_resale_price - max_bid_ceiling))
+    profit_margin_num  = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
+    profit_margin_pct  = f"{profit_margin_num:.1f}%"
+
+    # Educational offer band (40–65% of MMV)
+    low_offer  = int(round(mmv * 0.40))
+    high_offer = int(round(mmv * 0.65))
+
+    cf_pct  = int(round(cf * 100))
+    mlf_pct = int(round(mlf * 100))
+
+    cf_note = f"CF={cf_pct}% (baseline 12%"
+    if cf_adjustments:
+        cf_note += " + " + " + ".join(cf_adjustments)
+    cf_note += ")"
+
+    bid_formula_note = (
+        f"MAX_BID = MMV × MLF × (1 − PM − CF) | "
+        f"MMV={_money(int(mmv))} | MLF={mlf_pct}% ({market_classification}) | "
+        f"PM=40% | {cf_note} | "
+        f"= {_money(int(mmv))} × {mlf} × {round(1 - pm - cf, 4):.4f}"
+    )
+    resale_formula_note = (
+        f"Low={mlf_pct - 5}% of MMV | Mid={mlf_pct}% of MMV (MLF) | "
+        f"High={mlf_pct + 3}% of MMV | MLF driven by {market_classification} market"
+    )
+
+    # ── Scores, flags, verdict ────────────────────────────────────────────────
     risk_score_num, risk_factors_applied, risk_explanation = _risk_score(stage1, stage2b)
     deal_score_num, scoring_factors, deal_explanation = _deal_score(stage1, stage2b, profit_margin_num)
     verdict = _verdict(deal_score_num)
@@ -755,8 +950,9 @@ def _build_report(
     strengths = []
     if market.get("market_classification") in {"Fast", "Normal"}:
         strengths.append(f"Market classified as {market.get('market_classification')}")
-    if _norm_text(stage1.get("legal_access_status")) not in {"", "unknown", "unclear", "not confirmed"}:
-        strengths.append(f"Access: {stage1.get('legal_access_status')}")
+    road_type = _norm_text(stage1.get("road_type") or "")
+    if road_type and road_type not in {"none", "unknown"}:
+        strengths.append(f"Road access: {stage1.get('road_type')}")
     if stage1.get("zoning_code"):
         strengths.append(f"Zoning identified: {stage1.get('zoning_code')}")
     if any(stage1.get(k) is True for k in ["electricity_available", "water_available", "sewer_available"]):
@@ -773,10 +969,11 @@ def _build_report(
     )
 
     summary = (
-        f"This {acreage:.2f}-acre parcel in {stage1.get('county')}, {stage1.get('state')} has a mid estimated market value of "
-        f"{_money(mid_estimated_value)} based primarily on median sold price per acre. "
-        f"The local market is classified as {market.get('market_classification') or 'Unknown'}, the recommended bid ceiling is "
-        f"{_money(max_bid_ceiling)}, and the expected resale target is {_money(suggested_resale_price)}."
+        f"This {acreage:.2f}-acre parcel in {stage1.get('county')}, {stage1.get('state')} "
+        f"has a mid estimated market value of {_money(mid_estimated_value)} based on median sold "
+        f"price per acre. The local market is classified as {market.get('market_classification') or 'Unknown'} "
+        f"(MLF={mlf_pct}%), CF={cf_pct}%, recommended bid ceiling is {_money(max_bid_ceiling)}, "
+        f"and the expected resale target is {_money(suggested_resale_price)}."
     )
 
     sources_checked = _dedupe_keep_order(
@@ -828,6 +1025,11 @@ def _build_report(
         },
         access_and_location={
             "road_type": stage1.get("road_type"),
+            "road_name": stage1.get("road_name"),
+            "road_condition": stage1.get("road_condition"),
+            "road_maintained_by": stage1.get("road_maintained_by"),
+            "year_round_access": stage1.get("year_round_access"),
+            "distance_to_paved_road": stage1.get("distance_to_paved_road"),
             "road_description": stage1.get("road_description"),
             "legal_access_status": stage1.get("legal_access_status"),
             "easements": stage1.get("easements"),
@@ -837,17 +1039,20 @@ def _build_report(
             "distance_to_nearest_city": stage1.get("distance_to_nearest_city"),
             "distance_to_lake_or_water": stage1.get("distance_to_lake_or_water"),
             "distance_to_major_attraction": stage1.get("distance_to_major_attraction"),
+            "major_attraction_name": stage1.get("major_attraction_name"),
             "nearby_structures": stage1.get("nearby_structures"),
             "nearby_housing_development": stage1.get("nearby_housing_development"),
             "power_lines_visible": stage1.get("power_lines_visible"),
             "population_growth_trend": stage1.get("population_growth_trend"),
             "county_growth_rate": stage1.get("county_growth_rate"),
             "building_permit_growth": stage1.get("building_permit_growth"),
+            "growth_notes": stage1.get("growth_notes"),
             "zoning": {
                 "zoning_code": stage1.get("zoning_code"),
                 "zoning_description": stage1.get("zoning_description"),
                 "allowed_uses": stage1.get("allowed_uses"),
                 "minimum_lot_size": stage1.get("minimum_lot_size"),
+                "setbacks": stage1.get("setbacks"),
                 "buildable": stage1.get("buildable"),
                 "residential_allowed": stage1.get("residential_allowed"),
                 "rv_allowed": stage1.get("rv_allowed"),
@@ -855,8 +1060,13 @@ def _build_report(
                 "tiny_homes_allowed": stage1.get("tiny_homes_allowed"),
                 "camping_allowed": stage1.get("camping_allowed"),
                 "off_grid_allowed": stage1.get("off_grid_allowed"),
+                "commercial_allowed": stage1.get("commercial_allowed"),
+                "agricultural_allowed": stage1.get("agricultural_allowed"),
                 "hoa_present": stage1.get("hoa_present"),
                 "hoa_fees": stage1.get("hoa_fees"),
+                "hoa_name": stage1.get("hoa_name"),
+                "planning_dept_phone": stage1.get("planning_dept_phone"),
+                "zoning_source_url": stage1.get("zoning_source_url"),
             },
             "utilities": {
                 "electricity_available": stage1.get("electricity_available"),
@@ -867,18 +1077,26 @@ def _build_report(
                 "gas_available": stage1.get("gas_available"),
                 "utility_at_street": stage1.get("utility_at_street"),
                 "utility_cost_estimate": stage1.get("utility_cost_estimate"),
+                "internet_provider": stage1.get("internet_provider"),
+                "internet_type": stage1.get("internet_type"),
+                "cell_coverage": stage1.get("cell_coverage"),
+                "cell_carriers": stage1.get("cell_carriers"),
             },
         },
         terrain_overview={
             "terrain_description": stage1.get("terrain_description"),
             "slope_classification": stage1.get("slope_classification"),
             "washes_or_arroyos": stage1.get("washes_or_arroyos"),
+            "wetlands_notes": stage1.get("wetlands_notes"),
             "nearby_parcel_usage": stage1.get("nearby_parcel_usage"),
             "flood_zone": stage1.get("flood_zone"),
             "flood_zone_designation": stage1.get("flood_zone_designation"),
+            "flood_map_url": stage1.get("flood_map_url"),
             "wetlands_risk": stage1.get("wetlands_risk"),
             "landslide_risk": stage1.get("landslide_risk"),
             "fire_risk": stage1.get("fire_risk"),
+            "fire_risk_source": stage1.get("fire_risk_source"),
+            "fire_risk_url": stage1.get("fire_risk_url"),
             "soil_suitability": stage1.get("soil_suitability"),
             "protected_land_status": stage1.get("protected_land_status"),
             "environmental_restrictions": stage1.get("environmental_restrictions"),
@@ -907,19 +1125,26 @@ def _build_report(
             "aggressive_resale": aggressive_resale,
             "suggested_resale_price": suggested_resale_price,
             "resale_timeline": resale_timeline,
-            "resale_formula_note": "Conservative=80% MMV | Mid/Suggested=90% MMV | Aggressive=95% MMV",
-            "recommended_tier_explanation": f"Suggested tier uses 90% of MMV based on {market.get('market_classification') or 'Unknown'} market conditions.",
+            "resale_formula_note": resale_formula_note,
+            "recommended_tier_explanation": (
+                f"Suggested tier uses MLF={mlf_pct}% of MMV based on "
+                f"{market_classification} market conditions."
+            ),
         },
         auction_bid_ceiling={
             "risk_tier": _risk_tier(risk_score_num),
-            "recovery_percentage": "90%",
+            "mlf": f"{mlf_pct}%",
+            "cf": f"{cf_pct}%",
+            "cf_breakdown": cf_adjustments if cf_adjustments else ["Baseline 12%, no additional risk factors"],
+            "pm": "40%",
+            "recovery_percentage": f"{mlf_pct}%",
             "low_bid_threshold": low_bid_threshold,
             "mid_bid_threshold": mid_bid_threshold,
             "max_bid_ceiling": max_bid_ceiling,
             "suggested_resale_price": suggested_resale_price,
             "expected_profit": expected_profit,
             "profit_margin_pct": profit_margin_pct,
-            "bid_formula_note": "MAX_BID = (0.90/1.40) × MMV | DR=10% | PM=40%",
+            "bid_formula_note": bid_formula_note,
             "risk_factors": risk_factors_applied,
         },
         days_on_market={
@@ -958,6 +1183,10 @@ def _build_report(
     return report.model_dump()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def analyze_apn(
     apn: str,
     county: str,
@@ -967,67 +1196,99 @@ async def analyze_apn(
 ) -> dict[str, Any]:
     baseline_context = _build_baseline_context(parcel_info)
 
-    stage1_core = await generate_structured(
-        prompt=STAGE1_CORE_PROMPT.format(
+    # ── STEP 1: Identity (must run first — others depend on address + GPS) ────
+    stage1a = await generate_structured(
+        prompt=STAGE1A_IDENTITY_PROMPT.format(
             apn=apn,
             county=county,
             state=state,
             baseline_context=baseline_context,
         ),
-        schema_model=Stage1Core,
+        schema_model=Stage1Identity,
         use_search=True,
-        thinking_level=THINKING_STAGE1_CORE,
-        max_output_tokens=16000,
+        thinking_level=THINKING_STAGE1A,
+        max_output_tokens=8000,
     )
 
-    if not stage1_core.gps_coordinates and parcel_info:
+    # Fallback GPS from database if Gemini didn't find it
+    if not stage1a.gps_coordinates and parcel_info:
         lat = getattr(parcel_info, "latitude", None)
         lng = getattr(parcel_info, "longitude", None)
         if lat and lng:
-            stage1_core.gps_coordinates = f"{lat}, {lng}"
+            stage1a.gps_coordinates = f"{lat}, {lng}"
 
-    maps_link, sat_link, street_link = _build_maps_links(stage1_core.gps_coordinates)
-    if not stage1_core.google_maps_link:
-        stage1_core.google_maps_link = maps_link
-    if not stage1_core.google_satellite_link:
-        stage1_core.google_satellite_link = sat_link
-    if not stage1_core.google_street_view_link:
-        stage1_core.google_street_view_link = street_link
+    maps_link, sat_link, street_link = _build_maps_links(stage1a.gps_coordinates)
+    if not stage1a.google_maps_link:
+        stage1a.google_maps_link = maps_link
+    if not stage1a.google_satellite_link:
+        stage1a.google_satellite_link = sat_link
+    if not stage1a.google_street_view_link:
+        stage1a.google_street_view_link = street_link
 
-    stage1_util = await generate_structured(
-        prompt=STAGE1_UTILITIES_PROMPT.format(
-            apn=apn,
-            county=county,
-            state=state,
-            street_address=stage1_core.street_address or "",
-            gps_coordinates=stage1_core.gps_coordinates or "",
+    address     = stage1a.street_address or ""
+    gps         = stage1a.gps_coordinates or f"{county}, {state}"
+    acreage_str = str(stage1a.acreage or getattr(parcel_info, "lot_size", "") or "")
+
+    # ── STEP 2: Zoning, Utilities, Environment, Comps — all in PARALLEL ───────
+    stage1b, stage1c, stage1d, stage2_raw = await asyncio.gather(
+        generate_structured(
+            prompt=STAGE1B_ZONING_PROMPT.format(
+                apn=apn, county=county, state=state,
+                street_address=address, gps_coordinates=gps,
+            ),
+            schema_model=Stage1Zoning,
+            use_search=True,
+            thinking_level=THINKING_STAGE1B,
+            max_output_tokens=10000,
         ),
-        schema_model=Stage1Utilities,
-        use_search=True,
-        thinking_level=THINKING_STAGE1_UTIL,
-        max_output_tokens=12000,
+        generate_structured(
+            prompt=STAGE1C_UTILITIES_PROMPT.format(
+                apn=apn, county=county, state=state,
+                street_address=address, gps_coordinates=gps,
+            ),
+            schema_model=Stage1Utilities,
+            use_search=True,
+            thinking_level=THINKING_STAGE1C,
+            max_output_tokens=10000,
+        ),
+        generate_structured(
+            prompt=STAGE1D_ENVIRONMENT_PROMPT.format(
+                apn=apn, county=county, state=state,
+                street_address=address, gps_coordinates=gps,
+                acreage=acreage_str,
+            ),
+            schema_model=Stage1Environment,
+            use_search=True,
+            thinking_level=THINKING_STAGE1D,
+            max_output_tokens=10000,
+        ),
+        generate_structured(
+            prompt=STAGE2_PROMPT.format(
+                apn=apn, county=county, state=state,
+                street_address=address, gps_coordinates=gps,
+                acreage=acreage_str,
+                zoning_code="",   # 1B runs in parallel; zoning unknown at this point
+            ),
+            schema_model=Stage2Raw,
+            use_search=True,
+            thinking_level=THINKING_STAGE2,
+            max_output_tokens=22000,
+        ),
     )
 
-    stage1 = _merged_stage1(stage1_core, stage1_util)
-
-    stage2_raw = await generate_structured(
-        prompt=STAGE2_PROMPT.format(
-            apn=apn,
-            county=county,
-            state=state,
-            street_address=stage1.get("street_address") or "",
-            gps_coordinates=stage1.get("gps_coordinates") or f"{county}, {state}",
-            acreage=stage1.get("acreage") or "",
-            zoning_code=stage1.get("zoning_code") or "",
-        ),
-        schema_model=Stage2Raw,
-        use_search=True,
-        thinking_level=THINKING_STAGE2,
-        max_output_tokens=22000,
+    # ── STEP 3: Merge all stages into one flat dict ───────────────────────────
+    stage1 = _merged_all_stages(
+        identity=stage1a,
+        zoning=stage1b,
+        utilities=stage1c,
+        environment=stage1d,
+        maps_link=maps_link,
+        sat_link=sat_link,
+        street_link=street_link,
     )
 
+    # ── STEP 4: Clean comps + build final report ──────────────────────────────
     stage2b = _clean_market_data(stage2_raw)
-
     final_report = _build_report(
         stage1=stage1,
         stage2b=stage2b,
