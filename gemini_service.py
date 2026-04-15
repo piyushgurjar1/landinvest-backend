@@ -825,8 +825,8 @@ def _compute_mlf(market_classification: str) -> float:
         "Fast": 0.90,
         "Normal": 0.85,
         "Slow": 0.80,
-        "Very Slow": 0.75,
-        "Unknown": 0.80,
+        "Very Slow": 0.80,
+        "Unknown": 0.85,
     }.get(market_classification, 0.80)
 
 
