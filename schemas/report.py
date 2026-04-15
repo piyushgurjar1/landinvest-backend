@@ -244,6 +244,8 @@ class ZoningInfo(CleanBaseModel):
     tiny_homes_allowed: Optional[bool] = None
     camping_allowed: Optional[bool] = None
     off_grid_allowed: Optional[bool] = None
+    commercial_allowed: Optional[bool] = None
+    agricultural_allowed: Optional[bool] = None
     hoa_present: Optional[bool] = Field(default=False)
     hoa_fees: Optional[str] = None
 
@@ -283,7 +285,7 @@ class AccessAndLocation(CleanBaseModel):
 class TerrainOverview(CleanBaseModel):
     terrain_description: Optional[str] = None
     slope_classification: Optional[str] = None
-    washes_or_arroyos: Optional[str] = None
+    washes_or_arroyos: Optional[bool] = Field(default=False)
     nearby_parcel_usage: Optional[str] = None
     flood_zone: Optional[bool] = Field(default=False)
     flood_zone_designation: Optional[str] = None
