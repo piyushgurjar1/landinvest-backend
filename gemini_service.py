@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
+import time
+import random
 import html as _html_module
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Any, Optional
 from urllib.parse import urlparse
 from html import unescape as html_unescape
-from typing import Any
 import requests
 import httpx
 from bs4 import BeautifulSoup
@@ -41,10 +42,41 @@ from gemini_prompts import (
     generate_structured,
 )
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+_logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared HTTP sessions
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+_ddg_session = requests.Session()
+_ddg_session.headers.update(_SEARCH_HEADERS)
+
+_bing_session = requests.Session()
+_bing_session.headers.update({
+    **_SEARCH_HEADERS,
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.4 Safari/605.1.15"
+    ),
+})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +229,7 @@ def _yes_no_unknown_to_bool(status: str) -> Optional[bool]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage merger — combines outputs of all 4 Stage-1 calls into one flat dict
+# Stage merger
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _merged_all_stages(
@@ -457,15 +489,15 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
                 f"Listing fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}"
             )
 
-    sold_ppa = [c.price_per_acre for c in clean_comps if c.price_per_acre]
+    sold_ppa   = [c.price_per_acre for c in clean_comps if c.price_per_acre]
     active_ppa = [r.price_per_acre for r in clean_listings if r.price_per_acre]
 
     median_sold_ppa = _median_int(sold_ppa)
-    avg_sold_ppa = _avg_int(sold_ppa)
-    avg_active_ppa = _avg_int(active_ppa)
+    avg_sold_ppa    = _avg_int(sold_ppa)
+    avg_active_ppa  = _avg_int(active_ppa)
 
     today = date.today()
-    d6 = today - timedelta(days=183)
+    d6  = today - timedelta(days=183)
     d12 = today - timedelta(days=365)
 
     sales_6 = 0
@@ -481,9 +513,9 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         if c.days_on_market is not None and c.days_on_market >= 0:
             doms.append(c.days_on_market)
 
-    inventory = len(clean_listings)
+    inventory      = len(clean_listings)
     sold_to_active = round(sales_12 / inventory, 2) if inventory else None
-    median_dom = _median_int(doms) if doms else None
+    median_dom     = _median_int(doms) if doms else None
     sales_velocity = f"{sales_12 / 12:.1f} sales/month"
 
     if median_dom is None and sold_to_active is None:
@@ -515,7 +547,7 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         "Unknown": None,
     }
 
-    zip_turnover_6 = (sales_6 / inventory * 100.0) if inventory else None
+    zip_turnover_6  = (sales_6  / inventory * 100.0) if inventory else None
     zip_turnover_12 = (sales_12 / inventory * 100.0) if inventory else None
 
     diff_pct = (
@@ -830,7 +862,7 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
     adjustments: list[str] = []
 
     water_avail = stage1.get("water_available")
-    elec_avail = stage1.get("electricity_available")
+    elec_avail  = stage1.get("electricity_available")
     if water_avail is not True and elec_avail is not True:
         cf += 0.03
         adjustments.append("No water & electricity confirmed: +3%")
@@ -843,83 +875,286 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DuckDuckGo URL enrichment  ← FULLY REPLACED
-# Exact same logic as the working standalone script.
-# Sequential (one at a time), no domain mapping, source field drives matching.
+# URL enrichment — 3-stage strategy for Render reliability
+#
+# Stage 1: Direct URL pattern construction for known sources (instant, no HTTP)
+# Stage 2: DDG HTML scrape with 3 query variants + backoff
+# Stage 3: Bing HTML scrape as fallback (different IP reputation from Render)
+#
+# Concurrency: Semaphore(1) — one request at a time on Render free tier.
+# Individual item timeout: 15 s. Total enrichment timeout: 60 s (caller).
 # ─────────────────────────────────────────────────────────────────────────────
 
-_logger = logging.getLogger(__name__)
+def _normalize_address_for_url(address: str) -> str:
+    """
+    Converts '17332 Masten Ave #1, Port Charlotte, FL 33954'
+    → '17332-Masten-Ave-1-Pt-Charlotte-FL-33954'
+    Matches Zillow's URL slug conventions.
+    """
+    import re
+    s = address.strip()
+
+    # City abbreviations Zillow uses in slugs
+    city_map = {
+        "Port Charlotte": "Pt-Charlotte",
+        "Fort Lauderdale": "Fort-Lauderdale",
+        "Fort Myers": "Fort-Myers",
+        "Fort Pierce": "Fort-Pierce",
+        "Fort Walton Beach": "Fort-Walton-Beach",
+        "Saint Petersburg": "St-Petersburg",
+        "Saint Augustine": "St-Augustine",
+        "West Palm Beach": "West-Palm-Beach",
+        "Boca Raton": "Boca-Raton",
+        "Coral Springs": "Coral-Springs",
+        "Cape Coral": "Cape-Coral",
+        "Daytona Beach": "Daytona-Beach",
+        "Boynton Beach": "Boynton-Beach",
+        "Delray Beach": "Delray-Beach",
+        "Palm Bay": "Palm-Bay",
+        "Palm Beach Gardens": "Palm-Beach-Gardens",
+        "Palm Coast": "Palm-Coast",
+        "Pembroke Pines": "Pembroke-Pines",
+        "Pompano Beach": "Pompano-Beach",
+        "Port Saint Lucie": "Port-St-Lucie",
+        "Spring Hill": "Spring-Hill",
+    }
+    for full, abbr in city_map.items():
+        s = s.replace(full, abbr)
+
+    s = re.sub(r"#\s*(\w+)", r"\1", s)   # #1 → 1, # 23 → 23
+    s = re.sub(r"Lot\s+(\w+)", r"LOT-\1", s, flags=re.IGNORECASE)  # Lot 20 → LOT-20
+    s = re.sub(r"\s+", "-", s)            # spaces → hyphens
+    s = re.sub(r"[,.]", "", s)            # strip commas and periods
+    s = re.sub(r"-{2,}", "-", s)          # collapse double hyphens
+    return s
 
 
-def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    query = f"{address} {source}"
-    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+def _try_pattern_url(address: str, source: str) -> Optional[str]:
+    """
+    Stage 1: Construct a plausible direct URL from address + source name.
+    No HTTP request — instant. Returns None if source pattern not recognised.
 
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
-    except Exception as e:
-        print(f"[ERROR] {address} -> {e}")
+    Note: Zillow search URLs are returned here as best-effort hints.
+    The homedetails slug requires a zpid which is unknowable without an API call,
+    so we return the search URL which reliably resolves to the correct listing page.
+    """
+    src = source.lower().strip().replace(" ", "").replace(".com", "")
+    encoded = requests.utils.quote(address.strip())
+
+    if "zillow" in src:
+        # Zillow search URL — always resolves even without knowing the zpid
+        slug = _normalize_address_for_url(address)
+        return f"https://www.zillow.com/homes/{slug}_rb/"
+
+    if "redfin" in src:
+        return f"https://www.redfin.com/search#location={encoded}"
+
+    if "realtor" in src:
+        return f"https://www.realtor.com/realestateandhomes-search/{encoded}"
+
+    if "landwatch" in src:
+        # LandWatch URLs are not predictable from address alone
         return None
 
-    soup = BeautifulSoup(res.text, "html.parser")
-    results = soup.select("a.result__a")
+    if "landsearch" in src:
+        return None
 
-    target = source.strip().lower()
-
-    for a in results:
-        raw = a.get("href")
-        if not raw:
-            continue
-
-        full_url = urljoin("https://duckduckgo.com", raw)
-        parsed = urlparse(full_url)
-        actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
-
-        if not actual_url:
-            continue
-
-        domain = urlparse(actual_url).netloc.lower()
-
-        if target in domain:
-            return actual_url
+    if "loopnet" in src:
+        return f"https://www.loopnet.com/search/land/for-sale/?sk={encoded}"
 
     return None
 
 
+def _build_ddg_queries(address: str, source: str) -> list[str]:
+    """
+    Returns up to 3 query variants to try against DDG — most specific first.
+    Quoted exact-address queries are most reliable on DDG.
+    """
+    src_clean = source.strip().replace(".com", "").strip()
+    street = address.split(",")[0].strip() if "," in address else address
+    city = address.split(",")[1].strip() if address.count(",") >= 1 else ""
+
+    return [
+        f'"{address}" site:{src_clean.lower()}.com',           # exact + site: operator
+        f'"{address}" {src_clean}',                             # exact address + source name
+        f'{street} {city} {src_clean} land listing',           # looser: street + city + source
+    ]
+
+
+def _scrape_ddg(query: str, target_domain: str) -> Optional[str]:
+    """
+    Single DDG HTML search attempt.
+    Returns the first result URL whose domain contains target_domain, or None.
+    Caller is responsible for retries and backoff.
+    """
+    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    try:
+        res = _ddg_session.get(url, timeout=12)
+        if res.status_code != 200:
+            _logger.debug("DDG HTTP %s for query %r", res.status_code, query[:70])
+            return None
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        for a in soup.select("a.result__a"):
+            raw = a.get("href", "")
+            if not raw:
+                continue
+
+            # Unwrap DDG redirect wrapper
+            parsed = urlparse(urljoin("https://duckduckgo.com", raw))
+            actual = parse_qs(parsed.query).get("uddg", [None])[0]
+
+            if not actual:
+                # Newer DDG versions sometimes use direct hrefs
+                actual = raw if raw.startswith("http") else None
+
+            if actual:
+                domain = urlparse(actual).netloc.lower()
+                if target_domain in domain:
+                    return actual
+
+        return None
+
+    except Exception as exc:
+        _logger.debug("DDG scrape error for %r: %s", query[:70], exc)
+        return None
+
+
+def _scrape_bing(address: str, source: str, target_domain: str) -> Optional[str]:
+    """
+    Stage 3: Bing HTML fallback.
+    Bing result anchors are direct links — no redirect unwrapping needed,
+    which makes parsing simpler and more robust than DDG.
+    Uses a Safari/macOS User-Agent to differentiate from the DDG session.
+    """
+    query = f'"{address}" {source.replace(".com", "").strip()} property listing'
+    url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=10"
+    try:
+        res = _bing_session.get(url, timeout=12)
+        if res.status_code != 200:
+            _logger.debug("Bing HTTP %s for %r", res.status_code, address)
+            return None
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # Bing primary result links
+        for a in soup.select("li.b_algo h2 a, li.b_algo a.tilk, #b_results h2 a"):
+            href = a.get("href", "")
+            if href.startswith("http") and target_domain in urlparse(href).netloc.lower():
+                return href
+
+        return None
+
+    except Exception as exc:
+        _logger.debug("Bing scrape error for %r: %s", address, exc)
+        return None
+
+
+def _fetch_url_for_property_sync(address: str, source: str) -> Optional[str]:
+    """
+    Full 3-stage synchronous URL resolution. Safe to call from asyncio.to_thread().
+
+    Stage 1 — URL pattern construction (instant, no HTTP)
+    Stage 2 — DDG HTML scrape (up to 3 query variants × 2 attempts each)
+    Stage 3 — Bing HTML scrape (single attempt, different engine + UA)
+
+    Backoff is via time.sleep() — correct for a thread worker, NOT asyncio.sleep().
+    """
+    src_norm = source.strip().lower().replace(" ", "").replace(".com", "")
+    target_domain = src_norm  # e.g. "zillow", "redfin", "landwatch"
+
+    # ── Stage 1: Pattern URL ─────────────────────────────────────────────────
+    pattern_url = _try_pattern_url(address, source)
+    if pattern_url:
+        _logger.debug("Stage 1 pattern hit: %r → %s", address, pattern_url)
+        return pattern_url
+
+    # ── Stage 2: DDG scrape ──────────────────────────────────────────────────
+    queries = _build_ddg_queries(address, source)
+    for q_idx, query in enumerate(queries):
+        for attempt in range(2):
+            result = _scrape_ddg(query, target_domain)
+            if result:
+                _logger.info(
+                    "DDG hit (q%d, attempt %d): %s → %s",
+                    q_idx, attempt, address, result
+                )
+                return result
+
+            # Progressive backoff: later queries and retries wait longer
+            sleep_secs = random.uniform(2.5 + q_idx * 0.5, 5.5 + q_idx * 1.0)
+            _logger.debug(
+                "DDG miss q%d/%d attempt %d/2 — sleeping %.1fs",
+                q_idx + 1, len(queries), attempt + 1, sleep_secs,
+            )
+            time.sleep(sleep_secs)
+
+    # ── Stage 3: Bing fallback ───────────────────────────────────────────────
+    _logger.debug("Trying Bing fallback for %r (source=%s)", address, source)
+    time.sleep(random.uniform(1.5, 3.0))
+    bing_result = _scrape_bing(address, source, target_domain)
+    if bing_result:
+        _logger.info("Bing hit: %s → %s", address, bing_result)
+        return bing_result
+
+    _logger.debug("All 3 stages failed for %r (source=%s)", address, source)
+    return None
+
+
 async def _enrich_source_urls(stage2b: dict) -> None:
+    """
+    Enriches source_url for every comp/listing that has an address + source.
+
+    Render free-tier tuning:
+    - Semaphore(1): strictly sequential — one request pipeline at a time.
+      Prevents Render's shared IPs from being flagged for burst scraping.
+    - Per-item asyncio.wait_for(timeout=15s): one slow DDG response cannot
+      block the entire batch.
+    - Random 1–3 s pre-task sleep: natural stagger between sequential items.
+    """
     items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
+    semaphore = asyncio.Semaphore(1)
 
-    for item in items:
+    async def _process_item(item: dict) -> None:
         address = item.get("address")
-        source = item.get("source")
-
+        source  = item.get("source")
         if not address or not source:
-            continue
+            return
 
-        url = await asyncio.to_thread(
-            _ddg_fetch_url_for_property, address, source
-        )
+        async with semaphore:
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+            try:
+                url = await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_url_for_property_sync, address, source),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                _logger.warning("Per-item timeout for: %s", address)
+                url = None
 
         if url:
             item["source_url"] = url
-            _logger.info("Enriched URL: %s → %s", address, url)
+            _logger.info("Enriched: %s → %s", address, url)
         else:
-            _logger.debug("No DDG URL found for: %s (source=%s)", address, source)
+            _logger.debug("No URL found: %s (source=%s)", address, source)
+
         print(f"{address} → {url}")
 
-        await asyncio.sleep(3)
+    await asyncio.gather(*[_process_item(item) for item in items])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FL_SELL_COST   = 0.10
-_FL_CARRY_COST  = 0.04
-_FL_RISK_BUFFER = 0.08
-_FL_AUCTION_FEE = 0.05
+_FL_SELL_COST     = 0.10
+_FL_CARRY_COST    = 0.04
+_FL_RISK_BUFFER   = 0.08
+_FL_AUCTION_FEE   = 0.05
 _FL_TARGET_MARGIN = 0.40
-_FL_FIXED_COSTS = 0
-_FL_LF_DEFAULT  = 0.92
+_FL_FIXED_COSTS   = 0
+_FL_LF_DEFAULT    = 0.92
 
 
 def _is_florida(state: str | None) -> bool:
@@ -933,10 +1168,10 @@ def _compute_florida_bid(
     fixed_costs: float = _FL_FIXED_COSTS,
     auction_price: float | None = None,
 ) -> dict[str, Any]:
-    lf = _FL_LF_DEFAULT
+    lf         = _FL_LF_DEFAULT
     exit_price = mmv * lf
-    net_mult = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER
-    denom = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE
+    net_mult   = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER   # 0.78
+    denom      = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE                 # 1.45
 
     max_bid = ((exit_price * net_mult) - fixed_costs) / denom if denom else 0
     max_bid = max(int(round(max_bid)), 0)
@@ -949,20 +1184,19 @@ def _compute_florida_bid(
     aggressive_resale      = int(round(mmv * 0.96))
 
     auction_val = auction_price or max_bid
-    ratio = (auction_val / mmv) if mmv else 0.0
-    ratio = round(ratio, 4)
+    ratio       = round((auction_val / mmv), 4) if mmv else 0.0
 
     if ratio > 0.85:
-        tier = "NO BID"
+        tier      = "NO BID"
         hard_stop = True
     elif ratio > 0.75:
-        tier = "CAUTION"
+        tier      = "CAUTION"
         hard_stop = False
     elif ratio > 0.60:
-        tier = "PROCEED"
+        tier      = "PROCEED"
         hard_stop = False
     else:
-        tier = "STRONG BUY"
+        tier      = "STRONG BUY"
         hard_stop = False
 
     bid_formula_note = (
@@ -978,28 +1212,28 @@ def _compute_florida_bid(
     )
 
     return {
-        "max_bid_ceiling": max_bid,
-        "low_bid_threshold": low_bid,
-        "mid_bid_threshold": mid_bid,
-        "conservative_resale": conservative_resale,
+        "max_bid_ceiling":        max_bid,
+        "low_bid_threshold":      low_bid,
+        "mid_bid_threshold":      mid_bid,
+        "conservative_resale":    conservative_resale,
         "suggested_resale_price": suggested_resale_price,
-        "aggressive_resale": aggressive_resale,
-        "florida_lf": lf,
-        "florida_exit_price": int(round(exit_price)),
-        "florida_ratio": ratio,
-        "florida_ratio_tier": tier,
-        "florida_hard_stop": hard_stop,
-        "bid_formula_note": bid_formula_note,
-        "resale_formula_note": resale_formula_note,
-        "florida_mmv": int(round(mmv)),
-        "florida_sell_cost": _FL_SELL_COST,
-        "florida_carry_cost": _FL_CARRY_COST,
-        "florida_risk_buffer": _FL_RISK_BUFFER,
-        "florida_auction_fee": _FL_AUCTION_FEE,
-        "florida_target_margin": _FL_TARGET_MARGIN,
-        "florida_fixed_costs": int(fixed_costs),
+        "aggressive_resale":      aggressive_resale,
+        "florida_lf":             lf,
+        "florida_exit_price":     int(round(exit_price)),
+        "florida_ratio":          ratio,
+        "florida_ratio_tier":     tier,
+        "florida_hard_stop":      hard_stop,
+        "bid_formula_note":       bid_formula_note,
+        "resale_formula_note":    resale_formula_note,
+        "florida_mmv":            int(round(mmv)),
+        "florida_sell_cost":      _FL_SELL_COST,
+        "florida_carry_cost":     _FL_CARRY_COST,
+        "florida_risk_buffer":    _FL_RISK_BUFFER,
+        "florida_auction_fee":    _FL_AUCTION_FEE,
+        "florida_target_margin":  _FL_TARGET_MARGIN,
+        "florida_fixed_costs":    int(fixed_costs),
         "florida_net_multiplier": round(net_mult, 4),
-        "florida_denominator": round(denom, 4),
+        "florida_denominator":    round(denom, 4),
     }
 
 
@@ -1011,12 +1245,12 @@ def _build_report(
     stage1: dict[str, Any],
     stage2b: dict[str, Any],
 ) -> dict[str, Any]:
-    acreage = _safe_float(stage1.get("acreage"), 0.0)
-    median_ppa = _to_int_zero(stage2b.get("median_sold_price_per_acre"))
-    avg_sold_ppa = _to_int(stage2b.get("avg_sold_price_per_acre"))
+    acreage        = _safe_float(stage1.get("acreage"), 0.0)
+    median_ppa     = _to_int_zero(stage2b.get("median_sold_price_per_acre"))
+    avg_sold_ppa   = _to_int(stage2b.get("avg_sold_price_per_acre"))
     avg_active_ppa = _to_int(stage2b.get("avg_active_price_per_acre"))
 
-    mmv = median_ppa * acreage
+    mmv                  = median_ppa * acreage
     low_estimated_value  = int(round(median_ppa * 0.85 * acreage))
     mid_estimated_value  = int(round(mmv))
     high_estimated_value = int(round(median_ppa * 1.15 * acreage))
@@ -1045,18 +1279,18 @@ def _build_report(
     cf, cf_adjustments = _compute_cf(stage1)
     pm = 0.40
 
-    max_bid_ceiling   = int(round(mmv * mlf * (1 - pm - cf)))
-    low_bid_threshold = int(round(max_bid_ceiling * 0.85))
-    mid_bid_threshold = int(round(max_bid_ceiling * 0.925))
+    max_bid_ceiling    = int(round(mmv * mlf * (1 - pm - cf)))
+    low_bid_threshold  = int(round(max_bid_ceiling * 0.85))
+    mid_bid_threshold  = int(round(max_bid_ceiling * 0.925))
 
-    conservative_resale = int(round(mmv * (mlf - 0.05)))
-    mid_resale          = int(round(mmv * mlf))
-    aggressive_resale   = int(round(mmv * (mlf + 0.03)))
+    conservative_resale    = int(round(mmv * (mlf - 0.05)))
+    mid_resale             = int(round(mmv * mlf))
+    aggressive_resale      = int(round(mmv * (mlf + 0.03)))
     suggested_resale_price = mid_resale
 
-    expected_profit    = int(round(suggested_resale_price - max_bid_ceiling))
-    profit_margin_num  = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
-    profit_margin_pct  = f"{profit_margin_num:.1f}%"
+    expected_profit   = int(round(suggested_resale_price - max_bid_ceiling))
+    profit_margin_num = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
+    profit_margin_pct = f"{profit_margin_num:.1f}%"
 
     low_offer  = int(round(mmv * 0.40))
     high_offer = int(round(mmv * 0.65))
@@ -1081,23 +1315,46 @@ def _build_report(
     )
 
     risk_score_num, risk_factors_applied, risk_explanation = _risk_score(stage1, stage2b)
-    deal_score_num, scoring_factors, deal_explanation = _deal_score(stage1, stage2b, profit_margin_num)
+    deal_score_num, scoring_factors, deal_explanation      = _deal_score(stage1, stage2b, profit_margin_num)
     verdict = _verdict(deal_score_num)
 
-    market = stage2b["market_demand"]
+    market          = stage2b["market_demand"]
     resale_timeline = market.get("estimated_dom_range")
-    red_flags = _build_red_flags(stage1, stage2b, max_bid_ceiling)
+    red_flags       = _build_red_flags(stage1, stage2b, max_bid_ceiling)
     next_learning_step = _next_learning_step(stage1, red_flags)
 
-    state_val = stage1.get("state") or ""
+    # ── Florida override ──────────────────────────────────────────────────────
+    state_val        = stage1.get("state") or ""
     florida_bid_data = None
     if _is_florida(state_val):
         florida_bid_data = _compute_florida_bid(mmv, stage1, stage2b)
+
+        max_bid_ceiling        = florida_bid_data["max_bid_ceiling"]
+        low_bid_threshold      = florida_bid_data["low_bid_threshold"]
+        mid_bid_threshold      = florida_bid_data["mid_bid_threshold"]
+        conservative_resale    = florida_bid_data["conservative_resale"]
+        suggested_resale_price = florida_bid_data["suggested_resale_price"]
+        aggressive_resale      = florida_bid_data["aggressive_resale"]
+        bid_formula_note       = florida_bid_data["bid_formula_note"]
+        resale_formula_note    = florida_bid_data["resale_formula_note"]
+
+        expected_profit   = int(round(suggested_resale_price - max_bid_ceiling))
+        profit_margin_num = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
+        profit_margin_pct = f"{profit_margin_num:.1f}%"
+
         if florida_bid_data["florida_hard_stop"]:
-            red_flags.insert(0, f"🚫 FL HARD STOP — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} exceeds 85% threshold. DO NOT BID.")
+            red_flags.insert(
+                0,
+                f"🚫 FL HARD STOP — Auction/MMV ratio "
+                f"{florida_bid_data['florida_ratio']:.2%} exceeds 85% threshold. DO NOT BID.",
+            )
             verdict = "NO BID"
         elif florida_bid_data["florida_ratio_tier"] == "CAUTION":
-            red_flags.insert(0, f"⚠️ FL CAUTION — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} is in the 75-85% warning zone.")
+            red_flags.insert(
+                0,
+                f"⚠️ FL CAUTION — Auction/MMV ratio "
+                f"{florida_bid_data['florida_ratio']:.2%} is in the 75–85% warning zone.",
+            )
 
     strengths = []
     if market.get("market_classification") in {"Fast", "Normal"}:
@@ -1273,7 +1530,7 @@ def _build_report(
         },
         resale_price_range={
             "conservative_resale": conservative_resale,
-            "mid_resale": mid_resale,
+            "mid_resale": suggested_resale_price,
             "aggressive_resale": aggressive_resale,
             "suggested_resale_price": suggested_resale_price,
             "resale_timeline": resale_timeline,
@@ -1385,7 +1642,7 @@ async def analyze_apn(
     gps_val     = stage1a.gps_coordinates or f"{county}, {state}"
     acreage_str = str(stage1a.acreage or getattr(parcel_info, "lot_size", "") or "")
 
-    stage1a.street_address = address_val
+    stage1a.street_address  = address_val
     stage1a.gps_coordinates = gps_val
 
     stage1b, stage1c, stage1d, stage2_raw = await asyncio.gather(
@@ -1446,7 +1703,6 @@ async def analyze_apn(
 
     stage2b = _clean_market_data(stage2_raw)
 
-    # DDG URL enrichment — sequential, 1 at a time, 60s total timeout
     try:
         await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
     except asyncio.TimeoutError:
