@@ -42,39 +42,21 @@ from gemini_prompts import (
     generate_structured,
 )
 
-_logger = logging.getLogger(__name__)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared HTTP sessions
+# Shared HTTP session for DDG enrichment
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SEARCH_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml",
     "Connection": "keep-alive",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 _ddg_session = requests.Session()
-_ddg_session.headers.update(_SEARCH_HEADERS)
+_ddg_session.headers.update(HEADERS)
 
-_bing_session = requests.Session()
-_bing_session.headers.update({
-    **_SEARCH_HEADERS,
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.4 Safari/605.1.15"
-    ),
-})
+_logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -875,273 +857,105 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL enrichment — 3-stage strategy for Render reliability
+# DuckDuckGo URL enrichment — Sequential, one property at a time
 #
-# Stage 1: Direct URL pattern construction for known sources (instant, no HTTP)
-# Stage 2: DDG HTML scrape with 3 query variants + backoff
-# Stage 3: Bing HTML scrape as fallback (different IP reputation from Render)
+# WHY SEQUENTIAL:
+#   Semaphore(3) with asyncio.gather fires multiple requests close together.
+#   Even with staggered pre-delays, DDG detects burst patterns and returns
+#   empty result pages for most of the batch. Processing one property at a
+#   time with a consistent gap between requests is the most reliable approach
+#   on both local and Render free-tier (shared IP, limited connections).
 #
-# Concurrency: Semaphore(1) — one request at a time on Render free tier.
-# Individual item timeout: 15 s. Total enrichment timeout: 60 s (caller).
+# DESIGN:
+#   • _ddg_fetch_url_for_property — sync, runs in asyncio.to_thread.
+#     Retries up to 3 times. Uses time.sleep() (NOT asyncio.sleep) since
+#     it executes in a worker thread outside the event loop.
+#     On a no-match (results returned but none matched target domain) it
+#     returns None immediately — no point retrying with the same query.
+#   • _enrich_source_urls — processes items one by one in a for loop.
+#     Waits 3–6 s between each item. No semaphore, no gather.
+#     Total timeout of 120 s applied in analyze_apn().
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _normalize_address_for_url(address: str) -> str:
+def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
     """
-    Converts '17332 Masten Ave #1, Port Charlotte, FL 33954'
-    → '17332-Masten-Ave-1-Pt-Charlotte-FL-33954'
-    Matches Zillow's URL slug conventions.
+    Synchronous DDG HTML scraper. Safe to call from asyncio.to_thread().
+    Retries up to 3 times on HTTP errors or empty pages.
+    Returns None on no domain match (does not retry in that case).
     """
-    import re
-    s = address.strip()
+    query  = f"{address.strip()} {source.strip()}"
+    url    = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    target = source.strip().lower().replace(" ", "").replace(".com", "")
 
-    # City abbreviations Zillow uses in slugs
-    city_map = {
-        "Port Charlotte": "Pt-Charlotte",
-        "Fort Lauderdale": "Fort-Lauderdale",
-        "Fort Myers": "Fort-Myers",
-        "Fort Pierce": "Fort-Pierce",
-        "Fort Walton Beach": "Fort-Walton-Beach",
-        "Saint Petersburg": "St-Petersburg",
-        "Saint Augustine": "St-Augustine",
-        "West Palm Beach": "West-Palm-Beach",
-        "Boca Raton": "Boca-Raton",
-        "Coral Springs": "Coral-Springs",
-        "Cape Coral": "Cape-Coral",
-        "Daytona Beach": "Daytona-Beach",
-        "Boynton Beach": "Boynton-Beach",
-        "Delray Beach": "Delray-Beach",
-        "Palm Bay": "Palm-Bay",
-        "Palm Beach Gardens": "Palm-Beach-Gardens",
-        "Palm Coast": "Palm-Coast",
-        "Pembroke Pines": "Pembroke-Pines",
-        "Pompano Beach": "Pompano-Beach",
-        "Port Saint Lucie": "Port-St-Lucie",
-        "Spring Hill": "Spring-Hill",
-    }
-    for full, abbr in city_map.items():
-        s = s.replace(full, abbr)
+    for attempt in range(3):
+        try:
+            res = _ddg_session.get(url, timeout=12)
 
-    s = re.sub(r"#\s*(\w+)", r"\1", s)   # #1 → 1, # 23 → 23
-    s = re.sub(r"Lot\s+(\w+)", r"LOT-\1", s, flags=re.IGNORECASE)  # Lot 20 → LOT-20
-    s = re.sub(r"\s+", "-", s)            # spaces → hyphens
-    s = re.sub(r"[,.]", "", s)            # strip commas and periods
-    s = re.sub(r"-{2,}", "-", s)          # collapse double hyphens
-    return s
-
-
-def _try_pattern_url(address: str, source: str) -> Optional[str]:
-    """
-    Stage 1: Construct a plausible direct URL from address + source name.
-    No HTTP request — instant. Returns None if source pattern not recognised.
-
-    Note: Zillow search URLs are returned here as best-effort hints.
-    The homedetails slug requires a zpid which is unknowable without an API call,
-    so we return the search URL which reliably resolves to the correct listing page.
-    """
-    src = source.lower().strip().replace(" ", "").replace(".com", "")
-    encoded = requests.utils.quote(address.strip())
-
-    if "zillow" in src:
-        # Zillow search URL — always resolves even without knowing the zpid
-        slug = _normalize_address_for_url(address)
-        return f"https://www.zillow.com/homes/{slug}_rb/"
-
-    if "redfin" in src:
-        return f"https://www.redfin.com/search#location={encoded}"
-
-    if "realtor" in src:
-        return f"https://www.realtor.com/realestateandhomes-search/{encoded}"
-
-    if "landwatch" in src:
-        # LandWatch URLs are not predictable from address alone
-        return None
-
-    if "landsearch" in src:
-        return None
-
-    if "loopnet" in src:
-        return f"https://www.loopnet.com/search/land/for-sale/?sk={encoded}"
-
-    return None
-
-
-def _build_ddg_queries(address: str, source: str) -> list[str]:
-    """
-    Returns up to 3 query variants to try against DDG — most specific first.
-    Quoted exact-address queries are most reliable on DDG.
-    """
-    src_clean = source.strip().replace(".com", "").strip()
-    street = address.split(",")[0].strip() if "," in address else address
-    city = address.split(",")[1].strip() if address.count(",") >= 1 else ""
-
-    return [
-        f'"{address}" site:{src_clean.lower()}.com',           # exact + site: operator
-        f'"{address}" {src_clean}',                             # exact address + source name
-        f'{street} {city} {src_clean} land listing',           # looser: street + city + source
-    ]
-
-
-def _scrape_ddg(query: str, target_domain: str) -> Optional[str]:
-    """
-    Single DDG HTML search attempt.
-    Returns the first result URL whose domain contains target_domain, or None.
-    Caller is responsible for retries and backoff.
-    """
-    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-    try:
-        res = _ddg_session.get(url, timeout=12)
-        if res.status_code != 200:
-            _logger.debug("DDG HTTP %s for query %r", res.status_code, query[:70])
-            return None
-
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        for a in soup.select("a.result__a"):
-            raw = a.get("href", "")
-            if not raw:
+            if res.status_code != 200:
+                _logger.debug("DDG HTTP %s for %r (attempt %d)", res.status_code, address, attempt + 1)
+                time.sleep(random.uniform(2.0, 5.0))
                 continue
 
-            # Unwrap DDG redirect wrapper
-            parsed = urlparse(urljoin("https://duckduckgo.com", raw))
-            actual = parse_qs(parsed.query).get("uddg", [None])[0]
+            soup    = BeautifulSoup(res.text, "html.parser")
+            results = soup.select("a.result__a")
 
-            if not actual:
-                # Newer DDG versions sometimes use direct hrefs
-                actual = raw if raw.startswith("http") else None
+            if not results:
+                _logger.debug("DDG empty page for %r (attempt %d)", address, attempt + 1)
+                time.sleep(random.uniform(2.0, 5.0))
+                continue
 
-            if actual:
-                domain = urlparse(actual).netloc.lower()
-                if target_domain in domain:
-                    return actual
+            # Results came back — scan for target domain match
+            for a in results:
+                raw = a.get("href")
+                if not raw:
+                    continue
+                full_url   = urljoin("https://duckduckgo.com", raw)
+                parsed     = urlparse(full_url)
+                actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
+                if not actual_url:
+                    continue
+                domain = urlparse(actual_url).netloc.lower()
+                if target in domain:
+                    return actual_url
 
-        return None
-
-    except Exception as exc:
-        _logger.debug("DDG scrape error for %r: %s", query[:70], exc)
-        return None
-
-
-def _scrape_bing(address: str, source: str, target_domain: str) -> Optional[str]:
-    """
-    Stage 3: Bing HTML fallback.
-    Bing result anchors are direct links — no redirect unwrapping needed,
-    which makes parsing simpler and more robust than DDG.
-    Uses a Safari/macOS User-Agent to differentiate from the DDG session.
-    """
-    query = f'"{address}" {source.replace(".com", "").strip()} property listing'
-    url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=10"
-    try:
-        res = _bing_session.get(url, timeout=12)
-        if res.status_code != 200:
-            _logger.debug("Bing HTTP %s for %r", res.status_code, address)
+            # Got results but no domain match — retrying won't help
+            _logger.debug("DDG no domain match for %r (source=%s)", address, source)
             return None
 
-        soup = BeautifulSoup(res.text, "html.parser")
+        except Exception as exc:
+            _logger.debug("DDG exception for %r (attempt %d): %s", address, attempt + 1, exc)
+            time.sleep(random.uniform(2.0, 5.0))
 
-        # Bing primary result links
-        for a in soup.select("li.b_algo h2 a, li.b_algo a.tilk, #b_results h2 a"):
-            href = a.get("href", "")
-            if href.startswith("http") and target_domain in urlparse(href).netloc.lower():
-                return href
-
-        return None
-
-    except Exception as exc:
-        _logger.debug("Bing scrape error for %r: %s", address, exc)
-        return None
-
-
-def _fetch_url_for_property_sync(address: str, source: str) -> Optional[str]:
-    """
-    Full 3-stage synchronous URL resolution. Safe to call from asyncio.to_thread().
-
-    Stage 1 — URL pattern construction (instant, no HTTP)
-    Stage 2 — DDG HTML scrape (up to 3 query variants × 2 attempts each)
-    Stage 3 — Bing HTML scrape (single attempt, different engine + UA)
-
-    Backoff is via time.sleep() — correct for a thread worker, NOT asyncio.sleep().
-    """
-    src_norm = source.strip().lower().replace(" ", "").replace(".com", "")
-    target_domain = src_norm  # e.g. "zillow", "redfin", "landwatch"
-
-    # ── Stage 1: Pattern URL ─────────────────────────────────────────────────
-    pattern_url = _try_pattern_url(address, source)
-    if pattern_url:
-        _logger.debug("Stage 1 pattern hit: %r → %s", address, pattern_url)
-        return pattern_url
-
-    # ── Stage 2: DDG scrape ──────────────────────────────────────────────────
-    queries = _build_ddg_queries(address, source)
-    for q_idx, query in enumerate(queries):
-        for attempt in range(2):
-            result = _scrape_ddg(query, target_domain)
-            if result:
-                _logger.info(
-                    "DDG hit (q%d, attempt %d): %s → %s",
-                    q_idx, attempt, address, result
-                )
-                return result
-
-            # Progressive backoff: later queries and retries wait longer
-            sleep_secs = random.uniform(2.5 + q_idx * 0.5, 5.5 + q_idx * 1.0)
-            _logger.debug(
-                "DDG miss q%d/%d attempt %d/2 — sleeping %.1fs",
-                q_idx + 1, len(queries), attempt + 1, sleep_secs,
-            )
-            time.sleep(sleep_secs)
-
-    # ── Stage 3: Bing fallback ───────────────────────────────────────────────
-    _logger.debug("Trying Bing fallback for %r (source=%s)", address, source)
-    time.sleep(random.uniform(1.5, 3.0))
-    bing_result = _scrape_bing(address, source, target_domain)
-    if bing_result:
-        _logger.info("Bing hit: %s → %s", address, bing_result)
-        return bing_result
-
-    _logger.debug("All 3 stages failed for %r (source=%s)", address, source)
     return None
 
 
 async def _enrich_source_urls(stage2b: dict) -> None:
     """
-    Enriches source_url for every comp/listing that has an address + source.
-
-    Render free-tier tuning:
-    - Semaphore(1): strictly sequential — one request pipeline at a time.
-      Prevents Render's shared IPs from being flagged for burst scraping.
-    - Per-item asyncio.wait_for(timeout=15s): one slow DDG response cannot
-      block the entire batch.
-    - Random 1–3 s pre-task sleep: natural stagger between sequential items.
+    Enriches source_url for every comp / listing — ONE AT A TIME, sequentially.
+    Waits 3–6 s between each request to avoid DDG rate-limiting on Render.
     """
-    items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
-    semaphore = asyncio.Semaphore(1)
+    items = stage2b.get("clean_sold_comps", []) + stage2b.get("clean_active_listings", [])
 
-    async def _process_item(item: dict) -> None:
+    for item in items:
         address = item.get("address")
         source  = item.get("source")
+
         if not address or not source:
-            return
+            continue
 
-        async with semaphore:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            try:
-                url = await asyncio.wait_for(
-                    asyncio.to_thread(_fetch_url_for_property_sync, address, source),
-                    timeout=15.0,
-                )
-            except asyncio.TimeoutError:
-                _logger.warning("Per-item timeout for: %s", address)
-                url = None
+        try:
+            url = await asyncio.to_thread(_ddg_fetch_url_for_property, address, source)
+            if url:
+                item["source_url"] = url
+                _logger.info("✅ DDG enriched: %s → %s", address, url)
+            else:
+                _logger.debug("❌ DDG no match: %s (source=%s)", address, source)
+            print(f"{address} → {url}")
+        except Exception as exc:
+            _logger.error("DDG enrichment error for %s: %s", address, exc)
 
-        if url:
-            item["source_url"] = url
-            _logger.info("Enriched: %s → %s", address, url)
-        else:
-            _logger.debug("No URL found: %s (source=%s)", address, source)
-
-        print(f"{address} → {url}")
-
-    await asyncio.gather(*[_process_item(item) for item in items])
+        # Wait between each property — key to avoiding DDG rate-limits
+        await asyncio.sleep(random.uniform(3.0, 6.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1170,8 +984,8 @@ def _compute_florida_bid(
 ) -> dict[str, Any]:
     lf         = _FL_LF_DEFAULT
     exit_price = mmv * lf
-    net_mult   = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER   # 0.78
-    denom      = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE                 # 1.45
+    net_mult   = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER
+    denom      = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE
 
     max_bid = ((exit_price * net_mult) - fixed_costs) / denom if denom else 0
     max_bid = max(int(round(max_bid)), 0)
@@ -1323,7 +1137,6 @@ def _build_report(
     red_flags       = _build_red_flags(stage1, stage2b, max_bid_ceiling)
     next_learning_step = _next_learning_step(stage1, red_flags)
 
-    # ── Florida override ──────────────────────────────────────────────────────
     state_val        = stage1.get("state") or ""
     florida_bid_data = None
     if _is_florida(state_val):
@@ -1703,10 +1516,11 @@ async def analyze_apn(
 
     stage2b = _clean_market_data(stage2_raw)
 
+    # DDG URL enrichment — sequential, 1 at a time, 120 s hard timeout
     try:
-        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
+        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=120.0)
     except asyncio.TimeoutError:
-        _logger.warning("DDG URL enrichment timed out — using Gemini URLs only")
+        _logger.warning("DDG URL enrichment timed out — partial results kept")
 
     final_report = _build_report(
         stage1=stage1,
