@@ -918,20 +918,8 @@ async def process_item(item):
     return {**item, "url": url}
 
 
-async def _process_item(item: dict) -> dict:
-    address = item.get("address")
-    source  = item.get("source")
-
-    if not address or not source:
-        return {**item, "url": None}
-
-    url = await asyncio.to_thread(
-        _ddg_fetch_url_for_property, address, source
-    )
-
-    return {**item, "url": url}
-
 async def _enrich_source_urls(stage2b: dict) -> None:
+    # This creates a combined list of references to the original dictionaries
     items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
 
     semaphore = asyncio.Semaphore(3)
@@ -939,16 +927,20 @@ async def _enrich_source_urls(stage2b: dict) -> None:
     async def sem_task(item):
         async with semaphore:
             await asyncio.sleep(random.uniform(1, 3))
-            result = await _process_item(item)
+            # process_item returns a dict with the "url" key
+            result = await process_item(item)
+            
+            url = result.get("url")
+            if url:
+                # This mutates the original dictionary in the list
+                item["source_url"] = url
+                _logger.info("Enriched URL: %s → %s", item.get("address"), url)
+            else:
+                _logger.debug("No DDG URL found for: %s", item.get("address"))
+            
+            print(f"{item.get('address')} → {url}")
 
-        url = result.get("url")
-        if url:
-            item["source_url"] = url
-            _logger.info("Enriched URL: %s → %s", item.get("address"), url)
-        else:
-            _logger.debug("No DDG URL found for: %s (source=%s)", item.get("address"), item.get("source"))
-        print(f"{item.get('address')} → {url}")
-
+    # Gather runs all tasks; since we mutate 'item' inside, items/stage2b is updated
     await asyncio.gather(*[sem_task(i) for i in items])
 
 # ─────────────────────────────────────────────────────────────────────────────
