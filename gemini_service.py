@@ -863,20 +863,46 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
     query = f"{address.strip()} {source.strip()}"
     url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
 
-    for attempt in range(3):  # retry
+    target = (
+        source.strip()
+        .lower()
+        .replace("https://", "")
+        .replace("http://", "")
+        .replace("www.", "")
+        .rstrip("/")
+    )
+
+    for attempt in range(3):
         try:
-            res = session.get(url, timeout=10)
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            _logger.info(
+                "DDG attempt=%s address=%s source=%s status_code=%s",
+                attempt + 1,
+                address,
+                source,
+                res.status_code,
+            )
 
             if res.status_code != 200:
+                if attempt < 2:
+                    time.sleep(random.uniform(1.5, 4))
                 continue
 
             soup = BeautifulSoup(res.text, "html.parser")
             results = soup.select("a.result__a")
 
-            if not results:
-                continue
+            _logger.info(
+                "DDG attempt=%s address=%s results_empty=%s results_count=%s",
+                attempt + 1,
+                address,
+                not bool(results),
+                len(results),
+            )
 
-            target = source.lower().replace(" ", "").replace(".com", "")
+            if not results:
+                if attempt < 2:
+                    time.sleep(random.uniform(1.5, 4))
+                continue
 
             for a in results:
                 raw = a.get("href")
@@ -890,19 +916,39 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
                 if not actual_url:
                     continue
 
-                domain = urlparse(actual_url).netloc.lower()
+                domain = urlparse(actual_url).netloc.lower().replace("www.", "")
 
-                if target in domain:
+                _logger.info(
+                    "DDG attempt=%s address=%s candidate_domain=%s actual_url=%s",
+                    attempt + 1,
+                    address,
+                    domain,
+                    actual_url,
+                )
+
+                if domain == target or domain.endswith("." + target):
+                    _logger.info(
+                        "DDG matched address=%s source=%s matched_domain=%s",
+                        address,
+                        source,
+                        domain,
+                    )
                     return actual_url
 
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.exception(
+                "DDG fetch failed attempt=%s address=%s source=%s error=%s",
+                attempt + 1,
+                address,
+                source,
+                e,
+            )
 
-        # random backoff
-        time_sleep = random.uniform(1.5, 4)
-        asyncio.sleep(time_sleep)
+        if attempt < 2:
+            time.sleep(random.uniform(1.5, 4))
 
     return None
+
 
 async def process_item(item):
     address = item.get("address")
@@ -911,37 +957,34 @@ async def process_item(item):
     if not address or not source:
         return {**item, "url": None}
 
-    url = await asyncio.to_thread(
-        _ddg_fetch_url_for_property, address, source
-    )
-
+    url = await asyncio.to_thread(_ddg_fetch_url_for_property, address, source)
     return {**item, "url": url}
 
 
 async def _enrich_source_urls(stage2b: dict) -> None:
-    # This creates a combined list of references to the original dictionaries
-    items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
+    sold_items = stage2b.get("clean_sold_comps", [])
+    active_items = stage2b.get("clean_active_listings", [])
+    items = sold_items + active_items
 
     semaphore = asyncio.Semaphore(3)
 
     async def sem_task(item):
         async with semaphore:
             await asyncio.sleep(random.uniform(1, 3))
-            # process_item returns a dict with the "url" key
-            result = await process_item(item)
-            
-            url = result.get("url")
-            if url:
-                # This mutates the original dictionary in the list
-                item["source_url"] = url
-                _logger.info("Enriched URL: %s → %s", item.get("address"), url)
-            else:
-                _logger.debug("No DDG URL found for: %s", item.get("address"))
-            
-            print(f"{item.get('address')} → {url}")
+            return await process_item(item)
 
-    # Gather runs all tasks; since we mutate 'item' inside, items/stage2b is updated
-    await asyncio.gather(*[sem_task(i) for i in items])
+    results = await asyncio.gather(*(sem_task(item) for item in items))
+
+    for original_item, result in zip(items, results):
+        url = result.get("url")
+        original_item["source_url"] = url
+
+        if url:
+            _logger.info("Enriched URL: %s → %s", original_item.get("address"), url)
+        else:
+            _logger.debug("No DDG URL found for: %s", original_item.get("address"))
+
+        print(f"{original_item.get('address')} → {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
