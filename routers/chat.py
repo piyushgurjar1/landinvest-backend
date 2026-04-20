@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHAT_MODEL     = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+CHAT_MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")

@@ -17,15 +17,6 @@ CSV_TO_DB = {
     "latitude": "latitude",
     "longitude": "longitude",
     "address": "address",
-    "lot size": "lot_size",
-    "zoning": "zoning",
-    "assessment year": "assessment_year",
-    "total assessed value": "total_assessed_value",
-    "market value year": "market_value_year",
-    "total market value": "total_market_value",
-    "flood risk": "flood_risk",
-    "environmental hazard status": "environmental_hazard_status",
-    "bidding start value": "bidding_start_value",
 }
 
 
@@ -50,12 +41,11 @@ async def upload_csv(
 
     expected_cols = set(CSV_TO_DB.keys())
     actual_cols = set(df.columns)
-    missing_cols = expected_cols - actual_cols
-
-    if missing_cols:
+    
+    if "apn" not in actual_cols:
         raise HTTPException(
             status_code=400, 
-            detail=f"CSV is missing the following required columns: {', '.join(sorted(missing_cols))}"
+            detail="CSV is missing the required 'apn' column"
         )
 
     imported = 0
@@ -72,15 +62,12 @@ async def upload_csv(
             val = row.get(csv_col)
             if pd.notna(val) and val != "":
                 # Clean numeric fields if they come in as string with commas
-                if db_col in ("total_assessed_value", "total_market_value", "bidding_start_value", "latitude", "longitude"):
+                if db_col in ("latitude", "longitude"):
                     if isinstance(val, str):
                         try:
                             val = float(val.replace(",", "").replace("$", "").strip())
                         except ValueError:
                             pass # fallback to original if parsing fails
-                if db_col == "assessment_year" or db_col == "market_value_year":
-                    if isinstance(val, float):
-                        val = str(int(val)) # avoid 2026.0
 
                 record[db_col] = val
             else:

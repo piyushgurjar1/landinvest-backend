@@ -120,13 +120,14 @@ class HomepageSummary(CleanBaseModel):
 
 class SoldComp(CleanBaseModel):
     acreage: float = Field(description="Acreage of the comp parcel")
+    address: Optional[str] = Field(default=None, description="Full property address")
     sold_price: int = Field(description="Final sold price in USD")
     sold_date: Optional[str] = Field(default=None, description="Date of sale e.g. 2025-08-15")
     distance_or_location: Optional[str] = Field(default=None, description="Distance or rough location from subject parcel")
     price_per_acre: int = Field(description="Computed price per acre")
-    access_notes: Optional[str] = Field(default=None)
     terrain_notes: Optional[str] = Field(default=None)
     zoning: Optional[str] = Field(default=None)
+    source: Optional[str] = Field(default=None, description="Source website name e.g. Zillow, LandWatch")
     source_url: Optional[str] = Field(default=None)
 
     @field_validator("acreage", mode="before")
@@ -142,6 +143,7 @@ class SoldComp(CleanBaseModel):
 
 class ActiveListing(CleanBaseModel):
     acreage: float = Field(description="Acreage of the listing")
+    address: Optional[str] = Field(default=None, description="Full property address")
     listing_price: int = Field(description="Current asking price in USD")
     price_per_acre: int = Field(description="Computed price per acre")
     days_on_market: Optional[int] = Field(default=0)
@@ -500,6 +502,43 @@ class RiskScore(CleanBaseModel):
 
 
 
+# ─────────────────────────────────────────────────────────────
+# Florida-specific bid data
+# ─────────────────────────────────────────────────────────────
+
+class FloridaBidData(CleanBaseModel):
+    max_bid_ceiling: int = 0
+    low_bid_threshold: int = 0
+    mid_bid_threshold: int = 0
+    conservative_resale: int = 0
+    suggested_resale_price: int = 0
+    aggressive_resale: int = 0
+    florida_lf: float = 0.92
+    florida_exit_price: int = 0
+    florida_ratio: float = 0.0
+    florida_ratio_tier: str = "unknown"
+    florida_hard_stop: bool = False
+    bid_formula_note: str = ""
+    resale_formula_note: str = ""
+    florida_mmv: int = 0
+    florida_sell_cost: float = 0.10
+    florida_carry_cost: float = 0.04
+    florida_risk_buffer: float = 0.08
+    florida_auction_fee: float = 0.05
+    florida_target_margin: float = 0.40
+    florida_fixed_costs: int = 0
+    florida_net_multiplier: float = 0.78
+    florida_denominator: float = 1.45
+
+    @field_validator(
+        "max_bid_ceiling", "low_bid_threshold", "mid_bid_threshold",
+        "conservative_resale", "suggested_resale_price", "aggressive_resale",
+        "florida_exit_price", "florida_mmv", "florida_fixed_costs",
+        mode="before",
+    )
+    @classmethod
+    def round_fl_ints(cls, v: Any) -> int:
+        return _to_int_zero(v)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -526,6 +565,10 @@ class ParcelReport(CleanBaseModel):
     risk_score: Optional[RiskScore] = Field(
         default=None,
         description="Separate risk score 0-100, lower = less risky"
+    )
+    florida_bid_data: Optional[FloridaBidData] = Field(
+        default=None,
+        description="Florida-specific bid formula details, only present for FL properties"
     )
 
     red_flags: list[str] = Field(default_factory=list)
