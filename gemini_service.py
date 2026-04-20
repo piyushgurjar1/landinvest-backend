@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import json
 import asyncio
-import logging
-import time
 import random
+import requests
+
+import logging
 import html as _html_module
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Any, Optional
 from urllib.parse import urlparse
 from html import unescape as html_unescape
+from typing import Any
 import requests
 import httpx
 from bs4 import BeautifulSoup
@@ -42,10 +44,6 @@ from gemini_prompts import (
     generate_structured,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared HTTP session for DDG enrichment
-# ─────────────────────────────────────────────────────────────────────────────
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept-Language": "en-US,en;q=0.9",
@@ -53,12 +51,8 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-_ddg_session = requests.Session()
-_ddg_session.headers.update(HEADERS)
-
-_logger = logging.getLogger(__name__)
-
-
+session = requests.Session()
+session.headers.update(HEADERS)
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,7 +205,7 @@ def _yes_no_unknown_to_bool(status: str) -> Optional[bool]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage merger
+# Stage merger — combines outputs of all 4 Stage-1 calls into one flat dict
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _merged_all_stages(
@@ -471,15 +465,15 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
                 f"Listing fence based on median ${med:,}/acre: lower={int(lower):,}, upper={int(upper):,}"
             )
 
-    sold_ppa   = [c.price_per_acre for c in clean_comps if c.price_per_acre]
+    sold_ppa = [c.price_per_acre for c in clean_comps if c.price_per_acre]
     active_ppa = [r.price_per_acre for r in clean_listings if r.price_per_acre]
 
     median_sold_ppa = _median_int(sold_ppa)
-    avg_sold_ppa    = _avg_int(sold_ppa)
-    avg_active_ppa  = _avg_int(active_ppa)
+    avg_sold_ppa = _avg_int(sold_ppa)
+    avg_active_ppa = _avg_int(active_ppa)
 
     today = date.today()
-    d6  = today - timedelta(days=183)
+    d6 = today - timedelta(days=183)
     d12 = today - timedelta(days=365)
 
     sales_6 = 0
@@ -495,9 +489,9 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         if c.days_on_market is not None and c.days_on_market >= 0:
             doms.append(c.days_on_market)
 
-    inventory      = len(clean_listings)
+    inventory = len(clean_listings)
     sold_to_active = round(sales_12 / inventory, 2) if inventory else None
-    median_dom     = _median_int(doms) if doms else None
+    median_dom = _median_int(doms) if doms else None
     sales_velocity = f"{sales_12 / 12:.1f} sales/month"
 
     if median_dom is None and sold_to_active is None:
@@ -529,7 +523,7 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         "Unknown": None,
     }
 
-    zip_turnover_6  = (sales_6  / inventory * 100.0) if inventory else None
+    zip_turnover_6 = (sales_6 / inventory * 100.0) if inventory else None
     zip_turnover_12 = (sales_12 / inventory * 100.0) if inventory else None
 
     diff_pct = (
@@ -844,7 +838,7 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
     adjustments: list[str] = []
 
     water_avail = stage1.get("water_available")
-    elec_avail  = stage1.get("electricity_available")
+    elec_avail = stage1.get("electricity_available")
     if water_avail is not True and elec_avail is not True:
         cf += 0.03
         adjustments.append("No water & electricity confirmed: +3%")
@@ -857,118 +851,96 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DuckDuckGo URL enrichment — Sequential, one property at a time
-#
-# WHY SEQUENTIAL:
-#   Semaphore(3) with asyncio.gather fires multiple requests close together.
-#   Even with staggered pre-delays, DDG detects burst patterns and returns
-#   empty result pages for most of the batch. Processing one property at a
-#   time with a consistent gap between requests is the most reliable approach
-#   on both local and Render free-tier (shared IP, limited connections).
-#
-# DESIGN:
-#   • _ddg_fetch_url_for_property — sync, runs in asyncio.to_thread.
-#     Retries up to 3 times. Uses time.sleep() (NOT asyncio.sleep) since
-#     it executes in a worker thread outside the event loop.
-#     On a no-match (results returned but none matched target domain) it
-#     returns None immediately — no point retrying with the same query.
-#   • _enrich_source_urls — processes items one by one in a for loop.
-#     Waits 3–6 s between each item. No semaphore, no gather.
-#     Total timeout of 120 s applied in analyze_apn().
+# DuckDuckGo URL enrichment  ← FULLY REPLACED
+# Exact same logic as the working standalone script.
+# Sequential (one at a time), no domain mapping, source field drives matching.
 # ─────────────────────────────────────────────────────────────────────────────
 
+_logger = logging.getLogger(__name__)
+
+
 def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    """
-    Synchronous DDG HTML scraper. Safe to call from asyncio.to_thread().
-    Retries up to 3 times on HTTP errors or empty pages.
-    Returns None on no domain match (does not retry in that case).
-    """
     query  = f"{address.strip()} {source.strip()}"
     url    = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-    target = source.strip().lower().replace(" ", "").replace(".com", "")
+    target = source.lower().replace(" ", "").replace(".com", "")
 
     for attempt in range(3):
         try:
-            res = _ddg_session.get(url, timeout=12)
+            res = _ddg_session.get(url, timeout=10)
 
             if res.status_code != 200:
-                _logger.debug("DDG HTTP %s for %r (attempt %d)", res.status_code, address, attempt + 1)
-                time.sleep(random.uniform(2.0, 5.0))
+                time.sleep(random.uniform(1.5, 4.0))
                 continue
 
             soup    = BeautifulSoup(res.text, "html.parser")
             results = soup.select("a.result__a")
 
             if not results:
-                _logger.debug("DDG empty page for %r (attempt %d)", address, attempt + 1)
-                time.sleep(random.uniform(2.0, 5.0))
+                time.sleep(random.uniform(1.5, 4.0))
                 continue
 
-            # Results came back — scan for target domain match
             for a in results:
                 raw = a.get("href")
                 if not raw:
                     continue
+
                 full_url   = urljoin("https://duckduckgo.com", raw)
                 parsed     = urlparse(full_url)
                 actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
+
                 if not actual_url:
                     continue
+
                 domain = urlparse(actual_url).netloc.lower()
+
                 if target in domain:
                     return actual_url
 
-            # Got results but no domain match — retrying won't help
-            _logger.debug("DDG no domain match for %r (source=%s)", address, source)
-            return None
+        except Exception:
+            pass
 
-        except Exception as exc:
-            _logger.debug("DDG exception for %r (attempt %d): %s", address, attempt + 1, exc)
-            time.sleep(random.uniform(2.0, 5.0))
+        time.sleep(random.uniform(1.5, 4.0))   # ← time.sleep, NOT asyncio.sleep
 
     return None
 
 
 async def _enrich_source_urls(stage2b: dict) -> None:
-    """
-    Enriches source_url for every comp / listing — ONE AT A TIME, sequentially.
-    Waits 3–6 s between each request to avoid DDG rate-limiting on Render.
-    """
-    items = stage2b.get("clean_sold_comps", []) + stage2b.get("clean_active_listings", [])
+    items     = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
+    semaphore = asyncio.Semaphore(1)
 
-    for item in items:
+    async def _process_item(item: dict) -> None:
         address = item.get("address")
         source  = item.get("source")
 
         if not address or not source:
-            continue
+            return
 
-        try:
-            url = await asyncio.to_thread(_ddg_fetch_url_for_property, address, source)
-            if url:
-                item["source_url"] = url
-                _logger.info("✅ DDG enriched: %s → %s", address, url)
-            else:
-                _logger.debug("❌ DDG no match: %s (source=%s)", address, source)
-            print(f"{address} → {url}")
-        except Exception as exc:
-            _logger.error("DDG enrichment error for %s: %s", address, exc)
+        async with semaphore:
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+            url = await asyncio.to_thread(
+                _ddg_fetch_url_for_property, address, source
+            )
 
-        # Wait between each property — key to avoiding DDG rate-limits
-        await asyncio.sleep(random.uniform(3.0, 6.0))
+        if url:
+            item["source_url"] = url
+            _logger.info("Enriched URL: %s → %s", address, url)
+        else:
+            _logger.debug("No DDG URL found for: %s (source=%s)", address, source)
+        print(f"{address} → {url}")
 
+    await asyncio.gather(*[_process_item(item) for item in items])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FL_SELL_COST     = 0.10
-_FL_CARRY_COST    = 0.04
-_FL_RISK_BUFFER   = 0.08
-_FL_AUCTION_FEE   = 0.05
+_FL_SELL_COST   = 0.10
+_FL_CARRY_COST  = 0.04
+_FL_RISK_BUFFER = 0.08
+_FL_AUCTION_FEE = 0.05
 _FL_TARGET_MARGIN = 0.40
-_FL_FIXED_COSTS   = 0
-_FL_LF_DEFAULT    = 0.92
+_FL_FIXED_COSTS = 0
+_FL_LF_DEFAULT  = 0.92
 
 
 def _is_florida(state: str | None) -> bool:
@@ -982,10 +954,10 @@ def _compute_florida_bid(
     fixed_costs: float = _FL_FIXED_COSTS,
     auction_price: float | None = None,
 ) -> dict[str, Any]:
-    lf         = _FL_LF_DEFAULT
+    lf = _FL_LF_DEFAULT
     exit_price = mmv * lf
-    net_mult   = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER
-    denom      = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE
+    net_mult = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER
+    denom = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE
 
     max_bid = ((exit_price * net_mult) - fixed_costs) / denom if denom else 0
     max_bid = max(int(round(max_bid)), 0)
@@ -998,19 +970,20 @@ def _compute_florida_bid(
     aggressive_resale      = int(round(mmv * 0.96))
 
     auction_val = auction_price or max_bid
-    ratio       = round((auction_val / mmv), 4) if mmv else 0.0
+    ratio = (auction_val / mmv) if mmv else 0.0
+    ratio = round(ratio, 4)
 
     if ratio > 0.85:
-        tier      = "NO BID"
+        tier = "NO BID"
         hard_stop = True
     elif ratio > 0.75:
-        tier      = "CAUTION"
+        tier = "CAUTION"
         hard_stop = False
     elif ratio > 0.60:
-        tier      = "PROCEED"
+        tier = "PROCEED"
         hard_stop = False
     else:
-        tier      = "STRONG BUY"
+        tier = "STRONG BUY"
         hard_stop = False
 
     bid_formula_note = (
@@ -1026,28 +999,28 @@ def _compute_florida_bid(
     )
 
     return {
-        "max_bid_ceiling":        max_bid,
-        "low_bid_threshold":      low_bid,
-        "mid_bid_threshold":      mid_bid,
-        "conservative_resale":    conservative_resale,
+        "max_bid_ceiling": max_bid,
+        "low_bid_threshold": low_bid,
+        "mid_bid_threshold": mid_bid,
+        "conservative_resale": conservative_resale,
         "suggested_resale_price": suggested_resale_price,
-        "aggressive_resale":      aggressive_resale,
-        "florida_lf":             lf,
-        "florida_exit_price":     int(round(exit_price)),
-        "florida_ratio":          ratio,
-        "florida_ratio_tier":     tier,
-        "florida_hard_stop":      hard_stop,
-        "bid_formula_note":       bid_formula_note,
-        "resale_formula_note":    resale_formula_note,
-        "florida_mmv":            int(round(mmv)),
-        "florida_sell_cost":      _FL_SELL_COST,
-        "florida_carry_cost":     _FL_CARRY_COST,
-        "florida_risk_buffer":    _FL_RISK_BUFFER,
-        "florida_auction_fee":    _FL_AUCTION_FEE,
-        "florida_target_margin":  _FL_TARGET_MARGIN,
-        "florida_fixed_costs":    int(fixed_costs),
+        "aggressive_resale": aggressive_resale,
+        "florida_lf": lf,
+        "florida_exit_price": int(round(exit_price)),
+        "florida_ratio": ratio,
+        "florida_ratio_tier": tier,
+        "florida_hard_stop": hard_stop,
+        "bid_formula_note": bid_formula_note,
+        "resale_formula_note": resale_formula_note,
+        "florida_mmv": int(round(mmv)),
+        "florida_sell_cost": _FL_SELL_COST,
+        "florida_carry_cost": _FL_CARRY_COST,
+        "florida_risk_buffer": _FL_RISK_BUFFER,
+        "florida_auction_fee": _FL_AUCTION_FEE,
+        "florida_target_margin": _FL_TARGET_MARGIN,
+        "florida_fixed_costs": int(fixed_costs),
         "florida_net_multiplier": round(net_mult, 4),
-        "florida_denominator":    round(denom, 4),
+        "florida_denominator": round(denom, 4),
     }
 
 
@@ -1059,12 +1032,12 @@ def _build_report(
     stage1: dict[str, Any],
     stage2b: dict[str, Any],
 ) -> dict[str, Any]:
-    acreage        = _safe_float(stage1.get("acreage"), 0.0)
-    median_ppa     = _to_int_zero(stage2b.get("median_sold_price_per_acre"))
-    avg_sold_ppa   = _to_int(stage2b.get("avg_sold_price_per_acre"))
+    acreage = _safe_float(stage1.get("acreage"), 0.0)
+    median_ppa = _to_int_zero(stage2b.get("median_sold_price_per_acre"))
+    avg_sold_ppa = _to_int(stage2b.get("avg_sold_price_per_acre"))
     avg_active_ppa = _to_int(stage2b.get("avg_active_price_per_acre"))
 
-    mmv                  = median_ppa * acreage
+    mmv = median_ppa * acreage
     low_estimated_value  = int(round(median_ppa * 0.85 * acreage))
     mid_estimated_value  = int(round(mmv))
     high_estimated_value = int(round(median_ppa * 1.15 * acreage))
@@ -1093,18 +1066,18 @@ def _build_report(
     cf, cf_adjustments = _compute_cf(stage1)
     pm = 0.40
 
-    max_bid_ceiling    = int(round(mmv * mlf * (1 - pm - cf)))
-    low_bid_threshold  = int(round(max_bid_ceiling * 0.85))
-    mid_bid_threshold  = int(round(max_bid_ceiling * 0.925))
+    max_bid_ceiling   = int(round(mmv * mlf * (1 - pm - cf)))
+    low_bid_threshold = int(round(max_bid_ceiling * 0.85))
+    mid_bid_threshold = int(round(max_bid_ceiling * 0.925))
 
-    conservative_resale    = int(round(mmv * (mlf - 0.05)))
-    mid_resale             = int(round(mmv * mlf))
-    aggressive_resale      = int(round(mmv * (mlf + 0.03)))
+    conservative_resale = int(round(mmv * (mlf - 0.05)))
+    mid_resale          = int(round(mmv * mlf))
+    aggressive_resale   = int(round(mmv * (mlf + 0.03)))
     suggested_resale_price = mid_resale
 
-    expected_profit   = int(round(suggested_resale_price - max_bid_ceiling))
-    profit_margin_num = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
-    profit_margin_pct = f"{profit_margin_num:.1f}%"
+    expected_profit    = int(round(suggested_resale_price - max_bid_ceiling))
+    profit_margin_num  = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
+    profit_margin_pct  = f"{profit_margin_num:.1f}%"
 
     low_offer  = int(round(mmv * 0.40))
     high_offer = int(round(mmv * 0.65))
@@ -1129,45 +1102,23 @@ def _build_report(
     )
 
     risk_score_num, risk_factors_applied, risk_explanation = _risk_score(stage1, stage2b)
-    deal_score_num, scoring_factors, deal_explanation      = _deal_score(stage1, stage2b, profit_margin_num)
+    deal_score_num, scoring_factors, deal_explanation = _deal_score(stage1, stage2b, profit_margin_num)
     verdict = _verdict(deal_score_num)
 
-    market          = stage2b["market_demand"]
+    market = stage2b["market_demand"]
     resale_timeline = market.get("estimated_dom_range")
-    red_flags       = _build_red_flags(stage1, stage2b, max_bid_ceiling)
+    red_flags = _build_red_flags(stage1, stage2b, max_bid_ceiling)
     next_learning_step = _next_learning_step(stage1, red_flags)
 
-    state_val        = stage1.get("state") or ""
+    state_val = stage1.get("state") or ""
     florida_bid_data = None
     if _is_florida(state_val):
         florida_bid_data = _compute_florida_bid(mmv, stage1, stage2b)
-
-        max_bid_ceiling        = florida_bid_data["max_bid_ceiling"]
-        low_bid_threshold      = florida_bid_data["low_bid_threshold"]
-        mid_bid_threshold      = florida_bid_data["mid_bid_threshold"]
-        conservative_resale    = florida_bid_data["conservative_resale"]
-        suggested_resale_price = florida_bid_data["suggested_resale_price"]
-        aggressive_resale      = florida_bid_data["aggressive_resale"]
-        bid_formula_note       = florida_bid_data["bid_formula_note"]
-        resale_formula_note    = florida_bid_data["resale_formula_note"]
-
-        expected_profit   = int(round(suggested_resale_price - max_bid_ceiling))
-        profit_margin_num = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
-        profit_margin_pct = f"{profit_margin_num:.1f}%"
-
         if florida_bid_data["florida_hard_stop"]:
-            red_flags.insert(
-                0,
-                f"🚫 FL HARD STOP — Auction/MMV ratio "
-                f"{florida_bid_data['florida_ratio']:.2%} exceeds 85% threshold. DO NOT BID.",
-            )
+            red_flags.insert(0, f"🚫 FL HARD STOP — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} exceeds 85% threshold. DO NOT BID.")
             verdict = "NO BID"
         elif florida_bid_data["florida_ratio_tier"] == "CAUTION":
-            red_flags.insert(
-                0,
-                f"⚠️ FL CAUTION — Auction/MMV ratio "
-                f"{florida_bid_data['florida_ratio']:.2%} is in the 75–85% warning zone.",
-            )
+            red_flags.insert(0, f"⚠️ FL CAUTION — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} is in the 75-85% warning zone.")
 
     strengths = []
     if market.get("market_classification") in {"Fast", "Normal"}:
@@ -1343,7 +1294,7 @@ def _build_report(
         },
         resale_price_range={
             "conservative_resale": conservative_resale,
-            "mid_resale": suggested_resale_price,
+            "mid_resale": mid_resale,
             "aggressive_resale": aggressive_resale,
             "suggested_resale_price": suggested_resale_price,
             "resale_timeline": resale_timeline,
@@ -1455,7 +1406,7 @@ async def analyze_apn(
     gps_val     = stage1a.gps_coordinates or f"{county}, {state}"
     acreage_str = str(stage1a.acreage or getattr(parcel_info, "lot_size", "") or "")
 
-    stage1a.street_address  = address_val
+    stage1a.street_address = address_val
     stage1a.gps_coordinates = gps_val
 
     stage1b, stage1c, stage1d, stage2_raw = await asyncio.gather(
@@ -1516,11 +1467,11 @@ async def analyze_apn(
 
     stage2b = _clean_market_data(stage2_raw)
 
-    # DDG URL enrichment — sequential, 1 at a time, 120 s hard timeout
+    # DDG URL enrichment — sequential, 1 at a time, 60s total timeout
     try:
-        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=120.0)
+        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
     except asyncio.TimeoutError:
-        _logger.warning("DDG URL enrichment timed out — partial results kept")
+        _logger.warning("DDG URL enrichment timed out — using Gemini URLs only")
 
     final_report = _build_report(
         stage1=stage1,
