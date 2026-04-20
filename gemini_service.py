@@ -905,6 +905,7 @@ async def _enrich_source_urls(stage2b: dict) -> None:
             _logger.info("Enriched URL: %s → %s", address, url)
         else:
             _logger.debug("No DDG URL found for: %s (source=%s)", address, source)
+        print(f"{address} → {url}")
 
         await asyncio.sleep(3)
 
