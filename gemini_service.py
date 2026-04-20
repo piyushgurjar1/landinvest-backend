@@ -18,6 +18,7 @@ import requests
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote, quote
+from collections import defaultdict
 
 from schemas.report import ParcelReport
 
@@ -59,6 +60,69 @@ HEADERS = {
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+_logger = logging.getLogger(__name__)
+
+_ENRICH_API_URL = "https://test-9kmq.onrender.com/enrich"
+_ENRICH_API_BATCH_SIZE = 3
+_ENRICH_API_TIMEOUT = 60
+_ENRICH_API_COLD_START_TIMEOUT = 120
+_ENRICH_API_DELAY_MIN = 27
+_ENRICH_API_DELAY_MAX = 40
+_ENRICH_API_NULL_BATCH_COOLDOWN_MIN = 60
+_ENRICH_API_NULL_BATCH_COOLDOWN_MAX = 120
+_ENRICH_API_MAX_RETRIES = 3
+
+_warmed_up = False
+
+
+
+def _warm_up_enrich_api() -> None:
+    global _warmed_up
+    if _warmed_up:
+        return
+    try:
+        requests.get(
+            _ENRICH_API_URL.replace("/enrich", "/health"),
+            timeout=_ENRICH_API_COLD_START_TIMEOUT,
+        )
+    except Exception:
+        pass
+    _warmed_up = True
+
+
+def _post_enrich_payload(payload: dict[str, Any], is_first_call: bool = False) -> dict[str, Any] | None:
+    last_exc = None
+    timeout = _ENRICH_API_COLD_START_TIMEOUT if is_first_call else _ENRICH_API_TIMEOUT
+
+    for attempt in range(1, _ENRICH_API_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                _ENRICH_API_URL,
+                json=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            _logger.warning("Enrich API timeout on attempt %s/%s", attempt, _ENRICH_API_MAX_RETRIES)
+
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            _logger.warning("Enrich API request failed on attempt %s/%s: %s", attempt, _ENRICH_API_MAX_RETRIES, exc)
+
+        except Exception as exc:
+            last_exc = exc
+            _logger.exception("Unexpected enrich API error on attempt %s/%s: %s", attempt, _ENRICH_API_MAX_RETRIES, exc)
+
+        if attempt < _ENRICH_API_MAX_RETRIES:
+            retry_sleep = random.uniform(5, 12) * attempt
+            time.sleep(retry_sleep)
+
+    _logger.warning("Enrich API failed after retries: %s", last_exc)
+    return None
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -857,220 +921,168 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DuckDuckGo URL enrichment  ← FULLY REPLACED
-# Exact same logic as the working standalone script.
-# Sequential (one at a time), no domain mapping, source field drives matching.
+# URL enrichment via external API
+# Replaces the previous DuckDuckGo scraping approach.
+# POSTs clean_sold_comps + clean_active_listings to the enrichment endpoint
+# and writes the returned URLs back into the items in-place.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_logger = logging.getLogger(__name__)
+def _chunked(seq: list[Any], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
-def _normalize_source_domain(source: str) -> str:
-    s = (source or "").strip().lower()
-
-    if not s:
-        return ""
-
-    if not s.startswith(("http://", "https://")):
-        if "." not in s:
-            s = f"https://{s}.com"
-        else:
-            s = f"https://{s}"
-
-    netloc = urlparse(s).netloc.lower().replace("www.", "")
-    return netloc.rstrip("/")
+def _norm_enrich_key(address: Any, source: Any) -> tuple[str, str]:
+    return (
+        (address or "").strip().lower(),
+        (source or "").strip().lower(),
+    )
 
 
-def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    query = f"{(address or '').strip()} {(source or '').strip()}".strip()
-    if not query:
-        return None
+def _collect_urls_from_response(data: dict[str, Any]) -> dict[tuple[str, str], list[str]]:
+    buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-    target_domain = _normalize_source_domain(source)
-    if not target_domain:
-        return None
+    if not isinstance(data, dict):
+        return buckets
 
-    encoded_query = quote(query)
+    # Shape 1: {"results": [...]}
+    results = data.get("results")
+    if isinstance(results, list):
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            key = _norm_enrich_key(row.get("address"), row.get("source"))
+            url = row.get("source_url") or row.get("url")
+            if key != ("", "") and url:
+                buckets[key].append(url)
 
-    search_urls = [
-        f"https://html.duckduckgo.com/html/?q={encoded_query}",
-        f"https://duckduckgo.com/html/?q={encoded_query}",
-    ]
-
-    for attempt in range(1, 4):
-        for search_url in search_urls:
-            try:
-                with requests.Session() as session:
-                    session.headers.update(HEADERS)
-                    session.mount("https://", HTTPAdapter(max_retries=0))
-                    session.mount("http://", HTTPAdapter(max_retries=0))
-
-                    res = session.get(
-                        search_url,
-                        timeout=(3.5, 12),  # (connect_timeout, read_timeout)
-                        allow_redirects=True,
-                    )
-
-                _logger.info(
-                    "DDG attempt=%s address=%s source=%s url=%s status_code=%s final_url=%s",
-                    attempt,
-                    address,
-                    source,
-                    search_url,
-                    res.status_code,
-                    getattr(res, "url", None),
-                )
-
-                if res.status_code != 200:
+    # Shape 2: {"clean_sold_comps": [...], "clean_active_listings": [...]}
+    for group_key in ("clean_sold_comps", "clean_active_listings"):
+        rows = data.get(group_key)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
                     continue
+                key = _norm_enrich_key(row.get("address"), row.get("source"))
+                url = row.get("source_url") or row.get("url")
+                if key != ("", "") and url:
+                    buckets[key].append(url)
 
-                soup = BeautifulSoup(res.text, "html.parser")
-                results = soup.select("a.result__a")
+    return buckets
 
-                _logger.info(
-                    "DDG attempt=%s address=%s source=%s results_empty=%s results_count=%s",
-                    attempt,
-                    address,
-                    source,
-                    not bool(results),
-                    len(results),
-                )
 
-                if not results:
-                    continue
+def _post_enrich_payload(
+    payload: dict[str, Any],
+    is_first_call: bool = False,
+) -> dict[str, Any] | None:
+    last_exc = None
+    timeout = _ENRICH_API_COLD_START_TIMEOUT if is_first_call else _ENRICH_API_TIMEOUT
 
-                for rank, a in enumerate(results, start=1):
-                    raw_href = a.get("href")
-                    if not raw_href:
-                        continue
-
-                    full_url = urljoin("https://duckduckgo.com", raw_href)
-                    parsed = urlparse(full_url)
-                    actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
-
-                    if not actual_url and raw_href.startswith(("http://", "https://")):
-                        actual_url = raw_href
-
-                    if not actual_url:
-                        continue
-
-                    actual_url = requests.utils.unquote(actual_url)
-                    candidate_domain = urlparse(actual_url).netloc.lower().replace("www.", "")
-
-                    _logger.info(
-                        "DDG attempt=%s rank=%s address=%s source=%s candidate_domain=%s actual_url=%s",
-                        attempt,
-                        rank,
-                        address,
-                        source,
-                        candidate_domain,
-                        actual_url,
-                    )
-
-                    if (
-                        candidate_domain == target_domain
-                        or candidate_domain.endswith("." + target_domain)
-                    ):
-                        _logger.info(
-                            "DDG matched attempt=%s rank=%s address=%s source=%s matched_domain=%s actual_url=%s",
-                            attempt,
-                            rank,
-                            address,
-                            source,
-                            candidate_domain,
-                            actual_url,
-                        )
-                        return actual_url
-
-            except requests.exceptions.ConnectTimeout as e:
-                _logger.warning(
-                    "DDG connect timeout attempt=%s address=%s source=%s url=%s error=%s",
-                    attempt,
-                    address,
-                    source,
-                    search_url,
-                    e,
-                )
-            except requests.exceptions.ReadTimeout as e:
-                _logger.warning(
-                    "DDG read timeout attempt=%s address=%s source=%s url=%s error=%s",
-                    attempt,
-                    address,
-                    source,
-                    search_url,
-                    e,
-                )
-            except requests.exceptions.RequestException as e:
-                _logger.warning(
-                    "DDG request failed attempt=%s address=%s source=%s url=%s error=%s",
-                    attempt,
-                    address,
-                    source,
-                    search_url,
-                    e,
-                )
-            except Exception as e:
-                _logger.exception(
-                    "DDG unexpected error attempt=%s address=%s source=%s url=%s error=%s",
-                    attempt,
-                    address,
-                    source,
-                    search_url,
-                    e,
-                )
-
-        if attempt < 3:
-            sleep_for = random.uniform(2.5, 5.0)
-            _logger.info(
-                "DDG backoff attempt=%s address=%s source=%s sleep=%.2fs",
-                attempt,
-                address,
-                source,
-                sleep_for,
+    for attempt in range(1, _ENRICH_API_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                _ENRICH_API_URL,
+                json=payload,
+                timeout=timeout,
             )
-            time.sleep(sleep_for)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            _logger.warning(
+                "Enrich API timeout on attempt %s/%s",
+                attempt,
+                _ENRICH_API_MAX_RETRIES,
+            )
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            _logger.warning(
+                "Enrich API request failed on attempt %s/%s: %s",
+                attempt,
+                _ENRICH_API_MAX_RETRIES,
+                exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            _logger.exception(
+                "Unexpected enrich API error on attempt %s/%s: %s",
+                attempt,
+                _ENRICH_API_MAX_RETRIES,
+                exc,
+            )
 
+        if attempt < _ENRICH_API_MAX_RETRIES:
+            retry_sleep = random.uniform(5.0, 12.0) * attempt
+            time.sleep(retry_sleep)
+
+    _logger.warning("Enrich API failed after retries: %s", last_exc)
     return None
 
 
-async def process_item(item: dict[str, Any]) -> dict[str, Any]:
-    address = item.get("address")
-    source = item.get("source")
+def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
+    _warm_up_enrich_api()
 
-    if not address or not source:
-        return {**item, "url": None}
+    sold_items = stage2b.get("clean_sold_comps", [])
+    active_items = stage2b.get("clean_active_listings", [])
 
-    url = await asyncio.to_thread(_ddg_fetch_url_for_property, address, source)
-    return {**item, "url": url}
+    tagged_items = []
+    for item in sold_items:
+        if item.get("address") and item.get("source"):
+            tagged_items.append({"kind": "sold", "item": item})
+    for item in active_items:
+        if item.get("address") and item.get("source"):
+            tagged_items.append({"kind": "active", "item": item})
+
+    if not tagged_items:
+        return
+
+    total_batches = (len(tagged_items) + _ENRICH_API_BATCH_SIZE - 1) // _ENRICH_API_BATCH_SIZE
+
+    for batch_index, batch in enumerate(_chunked(tagged_items, _ENRICH_API_BATCH_SIZE), start=1):
+        payload = {
+            "clean_sold_comps": [
+                {"address": row["item"].get("address"), "source": row["item"].get("source")}
+                for row in batch if row["kind"] == "sold"
+            ],
+            "clean_active_listings": [
+                {"address": row["item"].get("address"), "source": row["item"].get("source")}
+                for row in batch if row["kind"] == "active"
+            ],
+        }
+
+        data = _post_enrich_payload(payload, is_first_call=(batch_index == 1))
+        if not data:
+            cooldown = random.uniform(_ENRICH_API_NULL_BATCH_COOLDOWN_MIN, _ENRICH_API_NULL_BATCH_COOLDOWN_MAX)
+            _logger.warning("No response for batch %s/%s, cooling down %.2fs", batch_index, total_batches, cooldown)
+            time.sleep(cooldown)
+            continue
+
+        url_buckets = _collect_urls_from_response(data)
+        found_count = 0
+
+        for row in batch:
+            item = row["item"]
+            key = _norm_enrich_key(item.get("address"), item.get("source"))
+            urls = url_buckets.get(key, [])
+            url = urls.pop(0) if urls else None
+            if url:
+                item["source_url"] = url
+                found_count += 1
+                _logger.info("Enriched URL: %s -> %s", item.get("address"), url)
+
+        if found_count == 0:
+            cooldown = random.uniform(_ENRICH_API_NULL_BATCH_COOLDOWN_MIN, _ENRICH_API_NULL_BATCH_COOLDOWN_MAX)
+            _logger.warning("Batch %s/%s returned all null, cooling down %.2fs", batch_index, total_batches, cooldown)
+            time.sleep(cooldown)
+        elif batch_index < total_batches:
+            sleep_for = random.uniform(_ENRICH_API_DELAY_MIN, _ENRICH_API_DELAY_MAX)
+            _logger.info("Sleeping %.2fs before next batch", sleep_for)
+            time.sleep(sleep_for)
 
 
 async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
-    sold_items = stage2b.get("clean_sold_comps", [])
-    active_items = stage2b.get("clean_active_listings", [])
-    items = sold_items + active_items
+    await asyncio.to_thread(_enrich_source_urls_via_api, stage2b)
 
-    if not items:
-        return
-
-    semaphore = asyncio.Semaphore(1)  # start with 1 on Render; raise to 2 only if stable
-
-    async def sem_task(item: dict[str, Any]) -> dict[str, Any]:
-        async with semaphore:
-            await asyncio.sleep(random.uniform(1.5, 3.5))
-            return await process_item(item)
-
-    results = await asyncio.gather(*(sem_task(item) for item in items))
-
-    for original_item, result in zip(items, results):
-        url = result.get("url")
-        original_item["source_url"] = url
-
-        if url:
-            _logger.info("Enriched URL: %s -> %s", original_item.get("address"), url)
-        else:
-            _logger.debug("No DDG URL found for: %s", original_item.get("address"))
-
-        print(f"{original_item.get('address')} -> {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
@@ -1609,11 +1621,11 @@ async def analyze_apn(
 
     stage2b = _clean_market_data(stage2_raw)
 
-    # DDG URL enrichment — sequential, 1 at a time, 60s total timeout
+    # URL enrichment via external API — 60 s total budget
     try:
         await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
     except asyncio.TimeoutError:
-        _logger.warning("DDG URL enrichment timed out — using Gemini URLs only")
+        _logger.warning("Enrich API timed out — using Gemini URLs only")
 
     final_report = _build_report(
         stage1=stage1,
