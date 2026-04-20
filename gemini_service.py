@@ -860,32 +860,31 @@ _logger = logging.getLogger(__name__)
 
 
 def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    query  = f"{address.strip()} {source.strip()}"
-    url    = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-    target = source.lower().replace(" ", "").replace(".com", "")
+    query = f"{address.strip()} {source.strip()}"
+    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
 
-    for attempt in range(3):
+    for attempt in range(3):  # retry
         try:
-            res = _ddg_session.get(url, timeout=10)
+            res = session.get(url, timeout=10)
 
             if res.status_code != 200:
-                time.sleep(random.uniform(1.5, 4.0))
                 continue
 
-            soup    = BeautifulSoup(res.text, "html.parser")
+            soup = BeautifulSoup(res.text, "html.parser")
             results = soup.select("a.result__a")
 
             if not results:
-                time.sleep(random.uniform(1.5, 4.0))
                 continue
+
+            target = source.lower().replace(" ", "").replace(".com", "")
 
             for a in results:
                 raw = a.get("href")
                 if not raw:
                     continue
 
-                full_url   = urljoin("https://duckduckgo.com", raw)
-                parsed     = urlparse(full_url)
+                full_url = urljoin("https://duckduckgo.com", raw)
+                parsed = urlparse(full_url)
                 actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
 
                 if not actual_url:
@@ -899,36 +898,58 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
         except Exception:
             pass
 
-        time.sleep(random.uniform(1.5, 4.0))   # ← time.sleep, NOT asyncio.sleep
+        # random backoff
+        time_sleep = random.uniform(1.5, 4)
+        asyncio.sleep(time_sleep)
 
     return None
 
+async def process_item(item):
+    address = item.get("address")
+    source = item.get("source")
+
+    if not address or not source:
+        return {**item, "url": None}
+
+    url = await asyncio.to_thread(
+        _ddg_fetch_url_for_property, address, source
+    )
+
+    return {**item, "url": url}
+
+
+async def _process_item(item: dict) -> dict:
+    address = item.get("address")
+    source  = item.get("source")
+
+    if not address or not source:
+        return {**item, "url": None}
+
+    url = await asyncio.to_thread(
+        _ddg_fetch_url_for_property, address, source
+    )
+
+    return {**item, "url": url}
 
 async def _enrich_source_urls(stage2b: dict) -> None:
-    items     = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
-    semaphore = asyncio.Semaphore(1)
+    items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
 
-    async def _process_item(item: dict) -> None:
-        address = item.get("address")
-        source  = item.get("source")
+    semaphore = asyncio.Semaphore(3)
 
-        if not address or not source:
-            return
-
+    async def sem_task(item):
         async with semaphore:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            url = await asyncio.to_thread(
-                _ddg_fetch_url_for_property, address, source
-            )
+            await asyncio.sleep(random.uniform(1, 3))
+            result = await _process_item(item)
 
+        url = result.get("url")
         if url:
             item["source_url"] = url
-            _logger.info("Enriched URL: %s → %s", address, url)
+            _logger.info("Enriched URL: %s → %s", item.get("address"), url)
         else:
-            _logger.debug("No DDG URL found for: %s (source=%s)", address, source)
-        print(f"{address} → {url}")
+            _logger.debug("No DDG URL found for: %s (source=%s)", item.get("address"), item.get("source"))
+        print(f"{item.get('address')} → {url}")
 
-    await asyncio.gather(*[_process_item(item) for item in items])
+    await asyncio.gather(*[sem_task(i) for i in items])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
