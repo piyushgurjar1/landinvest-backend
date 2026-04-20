@@ -17,7 +17,7 @@ from typing import Any
 import requests
 import httpx
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote
+from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote, quote
 
 from schemas.report import ParcelReport
 
