@@ -45,10 +45,16 @@ from gemini_prompts import (
 )
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml",
-    "Connection": "keep-alive",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "close",
 }
 
 session = requests.Session()
@@ -859,98 +865,175 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 _logger = logging.getLogger(__name__)
 
 
+def _normalize_source_domain(source: str) -> str:
+    s = (source or "").strip().lower()
+
+    if not s:
+        return ""
+
+    if not s.startswith(("http://", "https://")):
+        if "." not in s:
+            s = f"https://{s}.com"
+        else:
+            s = f"https://{s}"
+
+    netloc = urlparse(s).netloc.lower().replace("www.", "")
+    return netloc.rstrip("/")
+
+
 def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    query = f"{address.strip()} {source.strip()}"
-    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    query = f"{(address or '').strip()} {(source or '').strip()}".strip()
+    if not query:
+        return None
 
-    target = (
-        source.strip()
-        .lower()
-        .replace("https://", "")
-        .replace("http://", "")
-        .replace("www.", "")
-        .rstrip("/")
-    )
+    target_domain = _normalize_source_domain(source)
+    if not target_domain:
+        return None
 
-    for attempt in range(3):
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            _logger.info(
-                "DDG attempt=%s address=%s source=%s status_code=%s",
-                attempt + 1,
-                address,
-                source,
-                res.status_code,
-            )
+    encoded_query = quote(query)
 
-            if res.status_code != 200:
-                if attempt < 2:
-                    time.sleep(random.uniform(1.5, 4))
-                continue
+    search_urls = [
+        f"https://html.duckduckgo.com/html/?q={encoded_query}",
+        f"https://duckduckgo.com/html/?q={encoded_query}",
+    ]
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            results = soup.select("a.result__a")
+    for attempt in range(1, 4):
+        for search_url in search_urls:
+            try:
+                with requests.Session() as session:
+                    session.headers.update(HEADERS)
+                    session.mount("https://", HTTPAdapter(max_retries=0))
+                    session.mount("http://", HTTPAdapter(max_retries=0))
 
-            _logger.info(
-                "DDG attempt=%s address=%s results_empty=%s results_count=%s",
-                attempt + 1,
-                address,
-                not bool(results),
-                len(results),
-            )
-
-            if not results:
-                if attempt < 2:
-                    time.sleep(random.uniform(1.5, 4))
-                continue
-
-            for a in results:
-                raw = a.get("href")
-                if not raw:
-                    continue
-
-                full_url = urljoin("https://duckduckgo.com", raw)
-                parsed = urlparse(full_url)
-                actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
-
-                if not actual_url:
-                    continue
-
-                domain = urlparse(actual_url).netloc.lower().replace("www.", "")
+                    res = session.get(
+                        search_url,
+                        timeout=(3.5, 12),  # (connect_timeout, read_timeout)
+                        allow_redirects=True,
+                    )
 
                 _logger.info(
-                    "DDG attempt=%s address=%s candidate_domain=%s actual_url=%s",
-                    attempt + 1,
+                    "DDG attempt=%s address=%s source=%s url=%s status_code=%s final_url=%s",
+                    attempt,
                     address,
-                    domain,
-                    actual_url,
+                    source,
+                    search_url,
+                    res.status_code,
+                    getattr(res, "url", None),
                 )
 
-                if domain == target or domain.endswith("." + target):
+                if res.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(res.text, "html.parser")
+                results = soup.select("a.result__a")
+
+                _logger.info(
+                    "DDG attempt=%s address=%s source=%s results_empty=%s results_count=%s",
+                    attempt,
+                    address,
+                    source,
+                    not bool(results),
+                    len(results),
+                )
+
+                if not results:
+                    continue
+
+                for rank, a in enumerate(results, start=1):
+                    raw_href = a.get("href")
+                    if not raw_href:
+                        continue
+
+                    full_url = urljoin("https://duckduckgo.com", raw_href)
+                    parsed = urlparse(full_url)
+                    actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
+
+                    if not actual_url and raw_href.startswith(("http://", "https://")):
+                        actual_url = raw_href
+
+                    if not actual_url:
+                        continue
+
+                    actual_url = requests.utils.unquote(actual_url)
+                    candidate_domain = urlparse(actual_url).netloc.lower().replace("www.", "")
+
                     _logger.info(
-                        "DDG matched address=%s source=%s matched_domain=%s",
+                        "DDG attempt=%s rank=%s address=%s source=%s candidate_domain=%s actual_url=%s",
+                        attempt,
+                        rank,
                         address,
                         source,
-                        domain,
+                        candidate_domain,
+                        actual_url,
                     )
-                    return actual_url
 
-        except Exception as e:
-            _logger.exception(
-                "DDG fetch failed attempt=%s address=%s source=%s error=%s",
-                attempt + 1,
+                    if (
+                        candidate_domain == target_domain
+                        or candidate_domain.endswith("." + target_domain)
+                    ):
+                        _logger.info(
+                            "DDG matched attempt=%s rank=%s address=%s source=%s matched_domain=%s actual_url=%s",
+                            attempt,
+                            rank,
+                            address,
+                            source,
+                            candidate_domain,
+                            actual_url,
+                        )
+                        return actual_url
+
+            except requests.exceptions.ConnectTimeout as e:
+                _logger.warning(
+                    "DDG connect timeout attempt=%s address=%s source=%s url=%s error=%s",
+                    attempt,
+                    address,
+                    source,
+                    search_url,
+                    e,
+                )
+            except requests.exceptions.ReadTimeout as e:
+                _logger.warning(
+                    "DDG read timeout attempt=%s address=%s source=%s url=%s error=%s",
+                    attempt,
+                    address,
+                    source,
+                    search_url,
+                    e,
+                )
+            except requests.exceptions.RequestException as e:
+                _logger.warning(
+                    "DDG request failed attempt=%s address=%s source=%s url=%s error=%s",
+                    attempt,
+                    address,
+                    source,
+                    search_url,
+                    e,
+                )
+            except Exception as e:
+                _logger.exception(
+                    "DDG unexpected error attempt=%s address=%s source=%s url=%s error=%s",
+                    attempt,
+                    address,
+                    source,
+                    search_url,
+                    e,
+                )
+
+        if attempt < 3:
+            sleep_for = random.uniform(2.5, 5.0)
+            _logger.info(
+                "DDG backoff attempt=%s address=%s source=%s sleep=%.2fs",
+                attempt,
                 address,
                 source,
-                e,
+                sleep_for,
             )
-
-        if attempt < 2:
-            time.sleep(random.uniform(1.5, 4))
+            time.sleep(sleep_for)
 
     return None
 
 
-async def process_item(item):
+async def process_item(item: dict[str, Any]) -> dict[str, Any]:
     address = item.get("address")
     source = item.get("source")
 
@@ -961,16 +1044,19 @@ async def process_item(item):
     return {**item, "url": url}
 
 
-async def _enrich_source_urls(stage2b: dict) -> None:
+async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
     sold_items = stage2b.get("clean_sold_comps", [])
     active_items = stage2b.get("clean_active_listings", [])
     items = sold_items + active_items
 
-    semaphore = asyncio.Semaphore(3)
+    if not items:
+        return
 
-    async def sem_task(item):
+    semaphore = asyncio.Semaphore(1)  # start with 1 on Render; raise to 2 only if stable
+
+    async def sem_task(item: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:
-            await asyncio.sleep(random.uniform(1, 3))
+            await asyncio.sleep(random.uniform(1.5, 3.5))
             return await process_item(item)
 
     results = await asyncio.gather(*(sem_task(item) for item in items))
@@ -980,11 +1066,11 @@ async def _enrich_source_urls(stage2b: dict) -> None:
         original_item["source_url"] = url
 
         if url:
-            _logger.info("Enriched URL: %s → %s", original_item.get("address"), url)
+            _logger.info("Enriched URL: %s -> %s", original_item.get("address"), url)
         else:
             _logger.debug("No DDG URL found for: %s", original_item.get("address"))
 
-        print(f"{original_item.get('address')} → {url}")
+        print(f"{original_item.get('address')} -> {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Florida-specific bid engine
