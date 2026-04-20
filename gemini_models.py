@@ -208,6 +208,24 @@ class Stage1Utilities(StripMixin):
         default=None, description="Miles to nearest paved road if unpaved"
     )
 
+    # Legal access & easements
+    legal_access_status: Optional[str] = Field(
+        default=None,
+        description="Confirmed legal access | Easement required | Landlocked | Unknown"
+    )
+    road_description: Optional[str] = Field(
+        default=None,
+        description="Short description of road access situation, e.g. 'Dirt road off County Rd 42, maintained by county'"
+    )
+    easements: Optional[str] = Field(
+        default=None,
+        description="Known easements on or needed for the parcel, or null if none found"
+    )
+    landlocked: Optional[str] = Field(
+        default=None,
+        description="yes | no | unknown — whether the parcel has no direct road access"
+    )
+
     # RENAMED: sources_used_stage1_utilities → sources_used_stage1c
     sources_used_stage1c: list[str] = Field(default_factory=list)
 
@@ -298,6 +316,7 @@ class Stage1Environment(StripMixin):
 
 class RawSoldComp(StripMixin):
     apn: Optional[str] = None
+    address: Optional[str] = None
     sold_price: int = 0
     price_per_acre: int = 0
     acreage: float = 0.0
@@ -308,6 +327,7 @@ class RawSoldComp(StripMixin):
     terrain_notes: Optional[str] = None
     zoning: Optional[str] = None
     has_structures: bool = False
+    source: Optional[str] = None
     source_url: str = ""
 
     @field_validator("sold_price", "price_per_acre", "days_on_market", mode="before")
@@ -328,6 +348,7 @@ class RawSoldComp(StripMixin):
 
 class RawActiveListing(StripMixin):
     apn: Optional[str] = None
+    address: Optional[str] = None
     listing_price: int = 0
     price_per_acre: int = 0
     acreage: float = 0.0

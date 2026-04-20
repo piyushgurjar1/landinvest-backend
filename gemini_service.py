@@ -3,9 +3,18 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
+import html as _html_module
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Any, Optional
+from urllib.parse import urlparse
+from html import unescape as html_unescape
+from typing import Any
+import requests
+import httpx
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote
 
 from schemas.report import ParcelReport
 
@@ -32,7 +41,10 @@ from gemini_prompts import (
     generate_structured,
 )
 
-
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,14 +166,6 @@ def _build_baseline_context(parcel_info: Any) -> str:
     lines = []
     fields = [
         ("address", "Address"),
-        ("lot_size", "Lot Size"),
-        ("zoning", "Zoning"),
-        ("total_assessed_value", "Assessed Value"),
-        ("assessment_year", "Assessment Year"),
-        ("total_market_value", "Market Value"),
-        ("flood_risk", "Flood Risk"),
-        ("environmental_hazard_status", "Environmental Hazard"),
-        ("bidding_start_value", "Bidding Start Value"),
     ]
     for attr, label in fields:
         val = getattr(parcel_info, attr, None)
@@ -300,11 +304,11 @@ def _merged_all_stages(
         "building_permit_growth": environment.building_permit_growth,
         "growth_notes": environment.growth_notes,
 
-        # road/access fallbacks — use environment values if 1C didn't return them
-        "legal_access_status": None,   # 1C road section covers this via road_type
-        "road_description": None,
-        "easements": None,
-        "landlocked": None,
+        # road/access fallbacks
+        "legal_access_status": utilities.legal_access_status,
+        "road_description": utilities.road_description,
+        "easements": utilities.easements,
+        "landlocked": utilities.landlocked,
 
         # ── All sources merged ────────────────────────────────────────────────
         "sources_used_stage1": _dedupe_keep_order(
@@ -533,15 +537,16 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         "clean_sold_comps": [
             {
                 "apn": c.apn,
+                "address": c.address,
                 "sold_price": c.sold_price,
                 "price_per_acre": c.price_per_acre,
                 "acreage": c.acreage,
                 "distance_or_location": c.distance_or_location,
                 "sold_date": c.sold_date,
                 "days_on_market": c.days_on_market,
-                "access_notes": c.access_notes,
                 "terrain_notes": c.terrain_notes,
                 "zoning": c.zoning,
+                "source": c.source,
                 "source_url": c.source_url,
             }
             for c in clean_comps
@@ -549,6 +554,7 @@ def _clean_market_data(stage2_raw: Stage2Raw) -> dict[str, Any]:
         "clean_active_listings": [
             {
                 "apn": r.apn,
+                "address": r.address,
                 "listing_price": r.listing_price,
                 "price_per_acre": r.price_per_acre,
                 "acreage": r.acreage,
@@ -666,7 +672,6 @@ def _deal_score(
     factors = []
     total = 0
 
-    # ── Location: 5 pts ──────────────────────────────────────────────────────
     road   = _norm_text(stage1.get("road_type"))
     access = _norm_text(stage1.get("legal_access_status") or stage1.get("road_condition") or "")
 
@@ -685,14 +690,12 @@ def _deal_score(
     total += pts
     factors.append(note)
 
-    # ── Market: 20 pts ───────────────────────────────────────────────────────
     market = stage2b["market_demand"].get("market_classification")
     market_pts_map = {"Fast": 20, "Normal": 15, "Slow": 8, "Very Slow": 3, "Unknown": 8}
     pts = market_pts_map.get(market, 8)
     total += pts
     factors.append(f"Market: {pts}/20 — {market or 'Unknown'} market")
 
-    # ── Utilities: 20 pts ────────────────────────────────────────────────────
     util3 = sum(
         1 for k in ["electricity_available", "water_available", "sewer_available"]
         if stage1.get(k) is True
@@ -708,7 +711,6 @@ def _deal_score(
     total += pts
     factors.append(f"Utilities: {pts}/20 — {util3} of 3 core utilities confirmed")
 
-    # ── Profit: 50 pts ───────────────────────────────────────────────────────
     if profit_margin_pct_num > 200:
         pts = 50
     elif 100 <= profit_margin_pct_num <= 200:
@@ -720,7 +722,6 @@ def _deal_score(
     total += pts
     factors.append(f"Profit: {pts}/50 — Expected margin {profit_margin_pct_num:.1f}%")
 
-    # ── Risk: 5 pts ──────────────────────────────────────────────────────────
     risk_score_num, _, _ = _risk_score(stage1, stage2b)
     if 0 <= risk_score_num <= 19:
         pts = 5
@@ -735,6 +736,7 @@ def _deal_score(
 
     explanation = "Deal score blends profit margin (50), market speed (20), utilities (20), access (5), and risk (5)."
     return total, factors, explanation
+
 
 def _verdict(score: int) -> str:
     if score >= 75:
@@ -759,7 +761,6 @@ def _risk_tier(risk_score_num: int) -> str:
 def _build_red_flags(
     stage1: dict[str, Any],
     stage2b: dict[str, Any],
-    bidding_start_value: Optional[float],
     max_bid_ceiling: int,
 ) -> list[str]:
     flags = []
@@ -794,11 +795,6 @@ def _build_red_flags(
     if stage2b.get("data_confidence") == "Low":
         flags.append("Low comp confidence")
 
-    if bidding_start_value is not None and bidding_start_value > max_bid_ceiling:
-        flags.append(
-            f"Auction start {_money(bidding_start_value)} exceeds max bid ceiling {_money(max_bid_ceiling)}"
-        )
-
     return flags
 
 
@@ -820,7 +816,6 @@ def _next_learning_step(stage1: dict[str, Any], red_flags: list[str]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_mlf(market_classification: str) -> float:
-    """Market Liquidity Factor based on market speed."""
     return {
         "Fast": 0.90,
         "Normal": 0.85,
@@ -831,12 +826,6 @@ def _compute_mlf(market_classification: str) -> float:
 
 
 def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
-    """
-    Dynamic Cost Factor.
-    Baseline 12% + risk adjustments:
-      +3% if both water AND electricity are unavailable/unknown
-      +3% if septic or well is required
-    """
     cf = 0.12
     adjustments: list[str] = []
 
@@ -854,20 +843,178 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DuckDuckGo URL enrichment  ← FULLY REPLACED
+# Exact same logic as the working standalone script.
+# Sequential (one at a time), no domain mapping, source field drives matching.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_logger = logging.getLogger(__name__)
+
+
+def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
+    query = f"{address} {source}"
+    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+    except Exception as e:
+        print(f"[ERROR] {address} -> {e}")
+        return None
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    results = soup.select("a.result__a")
+
+    target = source.strip().lower()
+
+    for a in results:
+        raw = a.get("href")
+        if not raw:
+            continue
+
+        full_url = urljoin("https://duckduckgo.com", raw)
+        parsed = urlparse(full_url)
+        actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
+
+        if not actual_url:
+            continue
+
+        domain = urlparse(actual_url).netloc.lower()
+
+        if target in domain:
+            return actual_url
+
+    return None
+
+
+async def _enrich_source_urls(stage2b: dict) -> None:
+    items = stage2b["clean_sold_comps"] + stage2b["clean_active_listings"]
+
+    for item in items:
+        address = item.get("address")
+        source = item.get("source")
+
+        if not address or not source:
+            continue
+
+        url = await asyncio.to_thread(
+            _ddg_fetch_url_for_property, address, source
+        )
+
+        if url:
+            item["source_url"] = url
+            _logger.info("Enriched URL: %s → %s", address, url)
+        else:
+            _logger.debug("No DDG URL found for: %s (source=%s)", address, source)
+
+        await asyncio.sleep(3)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Florida-specific bid engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FL_SELL_COST   = 0.10
+_FL_CARRY_COST  = 0.04
+_FL_RISK_BUFFER = 0.08
+_FL_AUCTION_FEE = 0.05
+_FL_TARGET_MARGIN = 0.40
+_FL_FIXED_COSTS = 0
+_FL_LF_DEFAULT  = 0.92
+
+
+def _is_florida(state: str | None) -> bool:
+    return _norm_text(state or "") in {"fl", "florida"}
+
+
+def _compute_florida_bid(
+    mmv: float,
+    stage1: dict[str, Any],
+    stage2b: dict[str, Any],
+    fixed_costs: float = _FL_FIXED_COSTS,
+    auction_price: float | None = None,
+) -> dict[str, Any]:
+    lf = _FL_LF_DEFAULT
+    exit_price = mmv * lf
+    net_mult = 1.0 - _FL_SELL_COST - _FL_CARRY_COST - _FL_RISK_BUFFER
+    denom = 1.0 + _FL_TARGET_MARGIN + _FL_AUCTION_FEE
+
+    max_bid = ((exit_price * net_mult) - fixed_costs) / denom if denom else 0
+    max_bid = max(int(round(max_bid)), 0)
+
+    low_bid = int(round(max_bid * 0.85))
+    mid_bid = int(round(max_bid * 0.925))
+
+    conservative_resale    = int(round(mmv * 0.88))
+    suggested_resale_price = int(round(mmv * 0.92))
+    aggressive_resale      = int(round(mmv * 0.96))
+
+    auction_val = auction_price or max_bid
+    ratio = (auction_val / mmv) if mmv else 0.0
+    ratio = round(ratio, 4)
+
+    if ratio > 0.85:
+        tier = "NO BID"
+        hard_stop = True
+    elif ratio > 0.75:
+        tier = "CAUTION"
+        hard_stop = False
+    elif ratio > 0.60:
+        tier = "PROCEED"
+        hard_stop = False
+    else:
+        tier = "STRONG BUY"
+        hard_stop = False
+
+    bid_formula_note = (
+        f"FL MAX_BID = ((MMV×LF × NET_MULT) − FIXED) ÷ DENOM | "
+        f"MMV={_money(int(mmv))} | LF={lf} | EXIT={_money(int(exit_price))} | "
+        f"NET_MULT={net_mult:.2f} | DENOM={denom:.2f} | "
+        f"MAX_BID={_money(max_bid)}"
+    )
+    resale_formula_note = (
+        f"FL Resale: Low=88% of MMV ({_money(conservative_resale)}) | "
+        f"Mid=92% of MMV ({_money(suggested_resale_price)}) | "
+        f"High=96% of MMV ({_money(aggressive_resale)})"
+    )
+
+    return {
+        "max_bid_ceiling": max_bid,
+        "low_bid_threshold": low_bid,
+        "mid_bid_threshold": mid_bid,
+        "conservative_resale": conservative_resale,
+        "suggested_resale_price": suggested_resale_price,
+        "aggressive_resale": aggressive_resale,
+        "florida_lf": lf,
+        "florida_exit_price": int(round(exit_price)),
+        "florida_ratio": ratio,
+        "florida_ratio_tier": tier,
+        "florida_hard_stop": hard_stop,
+        "bid_formula_note": bid_formula_note,
+        "resale_formula_note": resale_formula_note,
+        "florida_mmv": int(round(mmv)),
+        "florida_sell_cost": _FL_SELL_COST,
+        "florida_carry_cost": _FL_CARRY_COST,
+        "florida_risk_buffer": _FL_RISK_BUFFER,
+        "florida_auction_fee": _FL_AUCTION_FEE,
+        "florida_target_margin": _FL_TARGET_MARGIN,
+        "florida_fixed_costs": int(fixed_costs),
+        "florida_net_multiplier": round(net_mult, 4),
+        "florida_denominator": round(denom, 4),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report builder
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_report(
     stage1: dict[str, Any],
     stage2b: dict[str, Any],
-    bidding_start_value: Optional[float] = None,
 ) -> dict[str, Any]:
     acreage = _safe_float(stage1.get("acreage"), 0.0)
     median_ppa = _to_int_zero(stage2b.get("median_sold_price_per_acre"))
     avg_sold_ppa = _to_int(stage2b.get("avg_sold_price_per_acre"))
     avg_active_ppa = _to_int(stage2b.get("avg_active_price_per_acre"))
 
-    # ── Core MMV ─────────────────────────────────────────────────────────────
     mmv = median_ppa * acreage
     low_estimated_value  = int(round(median_ppa * 0.85 * acreage))
     mid_estimated_value  = int(round(mmv))
@@ -892,29 +1039,24 @@ def _build_report(
             f" Median vs average differs by {diff_pct:.1f}%, which suggests spread in comp quality."
         )
 
-    # ── Dynamic MLF + CF formula ──────────────────────────────────────────────
     market_classification = stage2b["market_demand"].get("market_classification", "Unknown")
     mlf = _compute_mlf(market_classification)
     cf, cf_adjustments = _compute_cf(stage1)
-    pm = 0.40  # fixed profit margin target
+    pm = 0.40
 
-    # MAX_BID = MMV × MLF × (1 − PM − CF)
     max_bid_ceiling   = int(round(mmv * mlf * (1 - pm - cf)))
     low_bid_threshold = int(round(max_bid_ceiling * 0.85))
     mid_bid_threshold = int(round(max_bid_ceiling * 0.925))
 
-    # RESALE RANGE: Low = MLF−5%, Mid = MLF, High = MLF+3%
     conservative_resale = int(round(mmv * (mlf - 0.05)))
     mid_resale          = int(round(mmv * mlf))
     aggressive_resale   = int(round(mmv * (mlf + 0.03)))
     suggested_resale_price = mid_resale
 
-    # Profit metrics
     expected_profit    = int(round(suggested_resale_price - max_bid_ceiling))
     profit_margin_num  = (expected_profit / max_bid_ceiling * 100.0) if max_bid_ceiling else 0.0
     profit_margin_pct  = f"{profit_margin_num:.1f}%"
 
-    # Educational offer band (40–65% of MMV)
     low_offer  = int(round(mmv * 0.40))
     high_offer = int(round(mmv * 0.65))
 
@@ -937,15 +1079,24 @@ def _build_report(
         f"High={mlf_pct + 3}% of MMV | MLF driven by {market_classification} market"
     )
 
-    # ── Scores, flags, verdict ────────────────────────────────────────────────
     risk_score_num, risk_factors_applied, risk_explanation = _risk_score(stage1, stage2b)
     deal_score_num, scoring_factors, deal_explanation = _deal_score(stage1, stage2b, profit_margin_num)
     verdict = _verdict(deal_score_num)
 
     market = stage2b["market_demand"]
     resale_timeline = market.get("estimated_dom_range")
-    red_flags = _build_red_flags(stage1, stage2b, bidding_start_value, max_bid_ceiling)
+    red_flags = _build_red_flags(stage1, stage2b, max_bid_ceiling)
     next_learning_step = _next_learning_step(stage1, red_flags)
+
+    state_val = stage1.get("state") or ""
+    florida_bid_data = None
+    if _is_florida(state_val):
+        florida_bid_data = _compute_florida_bid(mmv, stage1, stage2b)
+        if florida_bid_data["florida_hard_stop"]:
+            red_flags.insert(0, f"🚫 FL HARD STOP — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} exceeds 85% threshold. DO NOT BID.")
+            verdict = "NO BID"
+        elif florida_bid_data["florida_ratio_tier"] == "CAUTION":
+            red_flags.insert(0, f"⚠️ FL CAUTION — Auction/MMV ratio {florida_bid_data['florida_ratio']:.2%} is in the 75-85% warning zone.")
 
     strengths = []
     if market.get("market_classification") in {"Fast", "Normal"}:
@@ -1173,6 +1324,7 @@ def _build_report(
         red_flags=red_flags,
         next_learning_step=next_learning_step,
         sources_checked=sources_checked,
+        florida_bid_data=florida_bid_data,
         compliance_disclaimer=(
             "This report is for educational purposes only. It uses public information "
             "that can change at any time. This is not financial, legal, or tax advice "
@@ -1192,11 +1344,12 @@ async def analyze_apn(
     county: str,
     state: str,
     parcel_info: Any = None,
-    bidding_start_value: Optional[float] = None,
+    latitude: Optional[str] = None,
+    longitude: Optional[str] = None,
+    address: Optional[str] = None,
 ) -> dict[str, Any]:
     baseline_context = _build_baseline_context(parcel_info)
 
-    # ── STEP 1: Identity (must run first — others depend on address + GPS) ────
     stage1a = await generate_structured(
         prompt=STAGE1A_IDENTITY_PROMPT.format(
             apn=apn,
@@ -1210,12 +1363,14 @@ async def analyze_apn(
         max_output_tokens=8000,
     )
 
-    # Fallback GPS from database if Gemini didn't find it
-    if not stage1a.gps_coordinates and parcel_info:
-        lat = getattr(parcel_info, "latitude", None)
-        lng = getattr(parcel_info, "longitude", None)
-        if lat and lng:
-            stage1a.gps_coordinates = f"{lat}, {lng}"
+    if not stage1a.gps_coordinates:
+        if latitude and longitude:
+            stage1a.gps_coordinates = f"{latitude}, {longitude}"
+        elif parcel_info:
+            lat = getattr(parcel_info, "latitude", None)
+            lng = getattr(parcel_info, "longitude", None)
+            if lat and lng:
+                stage1a.gps_coordinates = f"{lat}, {lng}"
 
     maps_link, sat_link, street_link = _build_maps_links(stage1a.gps_coordinates)
     if not stage1a.google_maps_link:
@@ -1225,16 +1380,18 @@ async def analyze_apn(
     if not stage1a.google_street_view_link:
         stage1a.google_street_view_link = street_link
 
-    address     = stage1a.street_address or ""
-    gps         = stage1a.gps_coordinates or f"{county}, {state}"
+    address_val = address or stage1a.street_address or ""
+    gps_val     = stage1a.gps_coordinates or f"{county}, {state}"
     acreage_str = str(stage1a.acreage or getattr(parcel_info, "lot_size", "") or "")
 
-    # ── STEP 2: Zoning, Utilities, Environment, Comps — all in PARALLEL ───────
+    stage1a.street_address = address_val
+    stage1a.gps_coordinates = gps_val
+
     stage1b, stage1c, stage1d, stage2_raw = await asyncio.gather(
         generate_structured(
             prompt=STAGE1B_ZONING_PROMPT.format(
                 apn=apn, county=county, state=state,
-                street_address=address, gps_coordinates=gps,
+                street_address=address_val, gps_coordinates=gps_val,
             ),
             schema_model=Stage1Zoning,
             use_search=True,
@@ -1244,7 +1401,7 @@ async def analyze_apn(
         generate_structured(
             prompt=STAGE1C_UTILITIES_PROMPT.format(
                 apn=apn, county=county, state=state,
-                street_address=address, gps_coordinates=gps,
+                street_address=address_val, gps_coordinates=gps_val,
             ),
             schema_model=Stage1Utilities,
             use_search=True,
@@ -1254,7 +1411,7 @@ async def analyze_apn(
         generate_structured(
             prompt=STAGE1D_ENVIRONMENT_PROMPT.format(
                 apn=apn, county=county, state=state,
-                street_address=address, gps_coordinates=gps,
+                street_address=address_val, gps_coordinates=gps_val,
                 acreage=acreage_str,
             ),
             schema_model=Stage1Environment,
@@ -1265,9 +1422,9 @@ async def analyze_apn(
         generate_structured(
             prompt=STAGE2_PROMPT.format(
                 apn=apn, county=county, state=state,
-                street_address=address, gps_coordinates=gps,
+                street_address=address_val, gps_coordinates=gps_val,
                 acreage=acreage_str,
-                zoning_code="",   # 1B runs in parallel; zoning unknown at this point
+                zoning_code="",
             ),
             schema_model=Stage2Raw,
             use_search=True,
@@ -1276,7 +1433,6 @@ async def analyze_apn(
         ),
     )
 
-    # ── STEP 3: Merge all stages into one flat dict ───────────────────────────
     stage1 = _merged_all_stages(
         identity=stage1a,
         zoning=stage1b,
@@ -1287,12 +1443,17 @@ async def analyze_apn(
         street_link=street_link,
     )
 
-    # ── STEP 4: Clean comps + build final report ──────────────────────────────
     stage2b = _clean_market_data(stage2_raw)
+
+    # DDG URL enrichment — sequential, 1 at a time, 60s total timeout
+    try:
+        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
+    except asyncio.TimeoutError:
+        _logger.warning("DDG URL enrichment timed out — using Gemini URLs only")
+
     final_report = _build_report(
         stage1=stage1,
         stage2b=stage2b,
-        bidding_start_value=bidding_start_value,
     )
 
     validated = ParcelReport.model_validate(final_report)
@@ -1304,7 +1465,9 @@ def analyze_apn_sync(
     county: str,
     state: str,
     parcel_info: Any = None,
-    bidding_start_value: Optional[float] = None,
+    latitude: Optional[str] = None,
+    longitude: Optional[str] = None,
+    address: Optional[str] = None,
 ) -> dict[str, Any]:
     return asyncio.run(
         analyze_apn(
@@ -1312,7 +1475,9 @@ def analyze_apn_sync(
             county=county,
             state=state,
             parcel_info=parcel_info,
-            bidding_start_value=bidding_start_value,
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
         )
     )
 
@@ -1323,6 +1488,5 @@ if __name__ == "__main__":
         county="Apache",
         state="Arizona",
         parcel_info=None,
-        bidding_start_value=5000,
     )
     print(json.dumps(result, indent=2))

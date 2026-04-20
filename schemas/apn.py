@@ -7,6 +7,9 @@ class APNLookupRequest(BaseModel):
     apn: str
     county: Optional[str] = None
     state: Optional[str] = None
+    latitude: Optional[str] = None
+    longitude: Optional[str] = None
+    address: Optional[str] = None
 
 
 class APNReportResponse(BaseModel):
