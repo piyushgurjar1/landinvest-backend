@@ -19,7 +19,7 @@ import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote, quote
 from collections import defaultdict
-
+from enrich_api import enrich
 from schemas.report import ParcelReport
 
 from gemini_models import (
@@ -63,32 +63,14 @@ session.headers.update(HEADERS)
 
 _logger = logging.getLogger(__name__)
 
-_ENRICH_API_URL = "https://test-9kmq.onrender.com/enrich"
-_ENRICH_API_BATCH_SIZE = 4
-_ENRICH_API_TIMEOUT = 60
-_ENRICH_API_COLD_START_TIMEOUT = 120
-_ENRICH_API_DELAY_MIN = 27
-_ENRICH_API_DELAY_MAX = 40
-_ENRICH_API_NULL_BATCH_COOLDOWN_MIN = 60
-_ENRICH_API_NULL_BATCH_COOLDOWN_MAX = 120
-_ENRICH_API_MAX_RETRIES = 3
-
-_warmed_up = False
+_ENRICH_BATCH_SIZE              = 4    
+_ENRICH_DELAY_MIN               = 27   
+_ENRICH_DELAY_MAX               = 40   
+_ENRICH_NULL_BATCH_COOLDOWN_MIN = 60   
+_ENRICH_NULL_BATCH_COOLDOWN_MAX = 120  
 
 
 
-def _warm_up_enrich_api() -> None:
-    global _warmed_up
-    if _warmed_up:
-        return
-    try:
-        requests.get(
-            _ENRICH_API_URL.replace("/enrich", "/health"),
-            timeout=_ENRICH_API_COLD_START_TIMEOUT,
-        )
-    except Exception:
-        pass
-    _warmed_up = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
@@ -938,64 +920,16 @@ def _collect_urls_from_response(data: dict[str, Any]) -> dict[tuple[str, str], l
     return buckets
 
 
-def _post_enrich_payload(
-    payload: dict[str, Any],
-    is_first_call: bool = False,
-) -> dict[str, Any] | None:
-    last_exc = None
-    timeout = _ENRICH_API_COLD_START_TIMEOUT if is_first_call else _ENRICH_API_TIMEOUT
+async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
+    from enrich_api import enrich  # direct import — no HTTP, no cold start
 
-    for attempt in range(1, _ENRICH_API_MAX_RETRIES + 1):
-        try:
-            response = requests.post(
-                _ENRICH_API_URL,
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.Timeout as exc:
-            last_exc = exc
-            _logger.warning(
-                "Enrich API timeout on attempt %s/%s",
-                attempt,
-                _ENRICH_API_MAX_RETRIES,
-            )
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            _logger.warning(
-                "Enrich API request failed on attempt %s/%s: %s",
-                attempt,
-                _ENRICH_API_MAX_RETRIES,
-                exc,
-            )
-        except Exception as exc:
-            last_exc = exc
-            _logger.exception(
-                "Unexpected enrich API error on attempt %s/%s: %s",
-                attempt,
-                _ENRICH_API_MAX_RETRIES,
-                exc,
-            )
-
-        if attempt < _ENRICH_API_MAX_RETRIES:
-            retry_sleep = random.uniform(5.0, 12.0) * attempt
-            time.sleep(retry_sleep)
-
-    _logger.warning("Enrich API failed after retries: %s", last_exc)
-    return None
-
-
-def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
-    _warm_up_enrich_api()
-
-    sold_items = stage2b.get("clean_sold_comps", [])
+    sold_items   = stage2b.get("clean_sold_comps",      [])
     active_items = stage2b.get("clean_active_listings", [])
 
     tagged_items = []
     for item in sold_items:
         if item.get("address") and item.get("source"):
-            tagged_items.append({"kind": "sold", "item": item})
+            tagged_items.append({"kind": "sold",   "item": item})
     for item in active_items:
         if item.get("address") and item.get("source"):
             tagged_items.append({"kind": "active", "item": item})
@@ -1003,9 +937,11 @@ def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
     if not tagged_items:
         return
 
-    total_batches = (len(tagged_items) + _ENRICH_API_BATCH_SIZE - 1) // _ENRICH_API_BATCH_SIZE
+    total_batches = (len(tagged_items) + _ENRICH_BATCH_SIZE - 1) // _ENRICH_BATCH_SIZE
 
-    for batch_index, batch in enumerate(_chunked(tagged_items, _ENRICH_API_BATCH_SIZE), start=1):
+    for batch_index, batch in enumerate(
+        _chunked(tagged_items, _ENRICH_BATCH_SIZE), start=1
+    ):
         payload = {
             "clean_sold_comps": [
                 {"address": row["item"].get("address"), "source": row["item"].get("source")}
@@ -1017,12 +953,24 @@ def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
             ],
         }
 
-        data = _post_enrich_payload(payload, is_first_call=(batch_index == 1))
-        print(data)
+        try:
+            data = await enrich(payload)
+        except Exception as exc:
+            _logger.warning(
+                "enrich() failed for batch %s/%s: %s",
+                batch_index, total_batches, exc,
+            )
+            data = None
+
         if not data:
-            cooldown = random.uniform(_ENRICH_API_NULL_BATCH_COOLDOWN_MIN, _ENRICH_API_NULL_BATCH_COOLDOWN_MAX)
-            _logger.warning("No response for batch %s/%s, cooling down %.2fs", batch_index, total_batches, cooldown)
-            time.sleep(cooldown)
+            cooldown = random.uniform(
+                _ENRICH_NULL_BATCH_COOLDOWN_MIN, _ENRICH_NULL_BATCH_COOLDOWN_MAX
+            )
+            _logger.warning(
+                "No response for batch %s/%s, cooling down %.2fs",
+                batch_index, total_batches, cooldown,
+            )
+            await asyncio.sleep(cooldown)
             continue
 
         url_buckets = _collect_urls_from_response(data)
@@ -1030,26 +978,27 @@ def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
 
         for row in batch:
             item = row["item"]
-            key = _norm_enrich_key(item.get("address"), item.get("source"))
+            key  = _norm_enrich_key(item.get("address"), item.get("source"))
             urls = url_buckets.get(key, [])
-            url = urls.pop(0) if urls else None
+            url  = urls.pop(0) if urls else None
             if url:
                 item["source_url"] = url
                 found_count += 1
-                _logger.info("Enriched URL: %s -> %s", item.get("address"), url)
+                _logger.info("Enriched URL: %s → %s", item.get("address"), url)
 
         if found_count == 0:
-            cooldown = random.uniform(_ENRICH_API_NULL_BATCH_COOLDOWN_MIN, _ENRICH_API_NULL_BATCH_COOLDOWN_MAX)
-            _logger.warning("Batch %s/%s returned all null, cooling down %.2fs", batch_index, total_batches, cooldown)
-            time.sleep(cooldown)
+            cooldown = random.uniform(
+                _ENRICH_NULL_BATCH_COOLDOWN_MIN, _ENRICH_NULL_BATCH_COOLDOWN_MAX
+            )
+            _logger.warning(
+                "Batch %s/%s returned all null, cooling down %.2fs",
+                batch_index, total_batches, cooldown,
+            )
+            await asyncio.sleep(cooldown)
         elif batch_index < total_batches:
-            sleep_for = random.uniform(_ENRICH_API_DELAY_MIN, _ENRICH_API_DELAY_MAX)
+            sleep_for = random.uniform(_ENRICH_DELAY_MIN, _ENRICH_DELAY_MAX)
             _logger.info("Sleeping %.2fs before next batch", sleep_for)
-            time.sleep(sleep_for)
-
-
-async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
-    await asyncio.to_thread(_enrich_source_urls_via_api, stage2b)
+            await asyncio.sleep(sleep_for)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
