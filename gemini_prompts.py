@@ -29,7 +29,7 @@ THINKING_STAGE1A = "low"
 THINKING_STAGE1B = "low"
 THINKING_STAGE1C = "medium"
 THINKING_STAGE1D = "low"
-THINKING_STAGE2  = "high"
+THINKING_STAGE2  = "medium"
 
 # ── Per-stage timeout (seconds) ───────────────────────────────────────────────
 # Each individual Gemini call gets its own timeout.
