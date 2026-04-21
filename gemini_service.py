@@ -64,7 +64,7 @@ session.headers.update(HEADERS)
 _logger = logging.getLogger(__name__)
 
 _ENRICH_API_URL = "https://test-9kmq.onrender.com/enrich"
-_ENRICH_API_BATCH_SIZE = 3
+_ENRICH_API_BATCH_SIZE = 4
 _ENRICH_API_TIMEOUT = 60
 _ENRICH_API_COLD_START_TIMEOUT = 120
 _ENRICH_API_DELAY_MIN = 27
@@ -90,39 +90,6 @@ def _warm_up_enrich_api() -> None:
         pass
     _warmed_up = True
 
-
-def _post_enrich_payload(payload: dict[str, Any], is_first_call: bool = False) -> dict[str, Any] | None:
-    last_exc = None
-    timeout = _ENRICH_API_COLD_START_TIMEOUT if is_first_call else _ENRICH_API_TIMEOUT
-
-    for attempt in range(1, _ENRICH_API_MAX_RETRIES + 1):
-        try:
-            response = requests.post(
-                _ENRICH_API_URL,
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-
-        except requests.exceptions.Timeout as exc:
-            last_exc = exc
-            _logger.warning("Enrich API timeout on attempt %s/%s", attempt, _ENRICH_API_MAX_RETRIES)
-
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            _logger.warning("Enrich API request failed on attempt %s/%s: %s", attempt, _ENRICH_API_MAX_RETRIES, exc)
-
-        except Exception as exc:
-            last_exc = exc
-            _logger.exception("Unexpected enrich API error on attempt %s/%s: %s", attempt, _ENRICH_API_MAX_RETRIES, exc)
-
-        if attempt < _ENRICH_API_MAX_RETRIES:
-            retry_sleep = random.uniform(5, 12) * attempt
-            time.sleep(retry_sleep)
-
-    _logger.warning("Enrich API failed after retries: %s", last_exc)
-    return None
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1624,7 +1591,7 @@ async def analyze_apn(
 
     # URL enrichment via external API — 60 s total budget
     try:
-        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=60.0)
+        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=400.0)
     except asyncio.TimeoutError:
         _logger.warning("Enrich API timed out — using Gemini URLs only")
 
