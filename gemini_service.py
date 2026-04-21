@@ -1051,6 +1051,7 @@ def _enrich_source_urls_via_api(stage2b: dict[str, Any]) -> None:
         }
 
         data = _post_enrich_payload(payload, is_first_call=(batch_index == 1))
+        print(data)
         if not data:
             cooldown = random.uniform(_ENRICH_API_NULL_BATCH_COOLDOWN_MIN, _ENRICH_API_NULL_BATCH_COOLDOWN_MAX)
             _logger.warning("No response for batch %s/%s, cooling down %.2fs", batch_index, total_batches, cooldown)
