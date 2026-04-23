@@ -48,7 +48,6 @@ from gemini_prompts import (
 _logger = logging.getLogger(__name__)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -855,7 +854,7 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
     from enrich_api import enrich
 
-    sold_items   = stage2b.get("clean_sold_comps",      [])
+    sold_items = stage2b.get("clean_sold_comps", [])
     active_items = stage2b.get("clean_active_listings", [])
 
     # Build payload — only items with both address and source
@@ -872,8 +871,10 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
 
     total = len(payload["clean_sold_comps"]) + len(payload["clean_active_listings"])
     if total == 0:
+        _logger.info("No items to enrich.")
         return
 
+    _logger.info(f"Starting enrichment for {total} items...")
     try:
         data = await enrich(payload)
     except Exception as exc:
@@ -881,6 +882,7 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
         return
 
     if not data or not isinstance(data, dict):
+        _logger.warning("Received invalid data from enrich")
         return
 
     # Build lookup from results
@@ -899,6 +901,7 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
         addr = (item.get("address") or "").strip().lower()
         if addr and addr in url_map:
             item["source_url"] = url_map[addr]
+            _logger.info(f"Updated item with URL: {item['source_url']}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
