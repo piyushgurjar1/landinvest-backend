@@ -19,7 +19,7 @@ import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote, quote
 from collections import defaultdict
-
+from enrich_api import enrich
 from schemas.report import ParcelReport
 
 from gemini_models import (
@@ -48,19 +48,6 @@ from gemini_prompts import (
 _logger = logging.getLogger(__name__)
 
 
-
-def _warm_up_enrich_api() -> None:
-    global _warmed_up
-    if _warmed_up:
-        return
-    try:
-        requests.get(
-            _ENRICH_API_URL.replace("/enrich", "/health"),
-            timeout=_ENRICH_API_COLD_START_TIMEOUT,
-        )
-    except Exception:
-        pass
-    _warmed_up = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
@@ -866,9 +853,7 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
-    from enrich_api import enrich
-
-    sold_items = stage2b.get("clean_sold_comps", [])
+    sold_items   = stage2b.get("clean_sold_comps",      [])
     active_items = stage2b.get("clean_active_listings", [])
 
     # Build payload — only items with both address and source
@@ -887,13 +872,24 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
     if total == 0:
         return
 
-    try:
-        data = await enrich(payload)
-    except Exception as exc:
-        _logger.warning("URL enrichment failed: %s", exc)
-        return
+    # ✅ Call external Render API via HTTP POST (runs in thread — non-blocking)
+    def _post() -> dict | None:
+        try:
+            res = requests.post(
+                "https://test-9kmq.onrender.com/enrich",
+                json=payload,
+                timeout=400,   # generous timeout — Render cold start + DDG scraping
+            )
+            res.raise_for_status()
+            return res.json()
+        except Exception as exc:
+            _logger.warning("Render enrich API call failed: %s", exc)
+            return None
+
+    data = await asyncio.to_thread(_post)
 
     if not data or not isinstance(data, dict):
+        _logger.warning("Render enrich API returned empty or invalid response")
         return
 
     # Build lookup from results
@@ -903,7 +899,7 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
         if not isinstance(row, dict):
             continue
         addr = (row.get("address") or "").strip().lower()
-        url = row.get("source_url") or row.get("url")
+        url  = row.get("source_url") or row.get("url")
         if addr and url:
             url_map[addr] = url
 
