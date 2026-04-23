@@ -1443,9 +1443,9 @@ async def analyze_apn(
 
     # URL enrichment via external API — 60 s total budget
     try:
-        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=400.0)
+        await _enrich_source_urls(stage2b)
     except asyncio.TimeoutError:
-        _logger.warning("Enrich API timed out — using Gemini URLs only")
+       _logger.warning("Enrich API failed — using Gemini URLs only: %s", exc)
 
     final_report = _build_report(
         stage1=stage1,
