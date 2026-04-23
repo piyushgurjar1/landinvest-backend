@@ -469,8 +469,7 @@ async def generate_structured(
                 max_output_tokens=max_output_tokens,
             )
 
-            # ✅ Per-stage timeout — each Gemini call has 3 minutes max
-            # If Gemini hangs at network level, this raises TimeoutError cleanly
+            # ✅ Per-stage timeout — each Gemini call has its own timeout
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=MODEL,
@@ -485,19 +484,34 @@ async def generate_structured(
                 raise ValueError("Gemini returned empty response")
 
             _logger.info("Gemini stage completed (attempt %d/%d)", attempt, retries)
-            return schema_model.model_validate_json(text)
+
+            # Try direct parse first
+            try:
+                return schema_model.model_validate_json(text)
+            except Exception as parse_err:
+                # Attempt JSON repair on truncated / malformed responses
+                _logger.warning(
+                    "Direct JSON parse failed (attempt %d/%d): %s — trying repair",
+                    attempt, retries, parse_err,
+                )
+                repaired = _repair_json(text)
+                try:
+                    return schema_model.model_validate_json(repaired)
+                except Exception as repair_err:
+                    raise ValueError(
+                        f"JSON repair also failed: {repair_err}"
+                    ) from parse_err
 
         except asyncio.TimeoutError:
             last_error = TimeoutError(f"Gemini stage timed out after {_STAGE_TIMEOUT}s")
             _logger.warning("Gemini timeout on attempt %d/%d", attempt, retries)
             if attempt < retries:
-                await asyncio.sleep(10.0)  # short wait before retry on timeout
+                await asyncio.sleep(10.0)
 
         except Exception as e:
             last_error = e
             _logger.warning("Gemini error on attempt %d/%d: %s", attempt, retries, e)
             if attempt < retries:
-                # Exponential backoff — 30s, 60s — handles rate limits
                 wait = retry_delay * attempt
                 _logger.info("Retrying in %.0fs...", wait)
                 await asyncio.sleep(wait)
@@ -505,3 +519,52 @@ async def generate_structured(
     raise RuntimeError(
         f"Gemini structured call failed after {retries} attempts: {last_error}"
     )
+
+
+def _repair_json(text: str) -> str:
+    """Best-effort repair of truncated / malformed JSON from Gemini."""
+    import re
+
+    # Strip markdown code fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
+
+    # Close any unclosed string (odd number of unescaped quotes)
+    quote_count = 0
+    i = 0
+    while i < len(text):
+        if text[i] == '"' and (i == 0 or text[i - 1] != '\\'):
+            quote_count += 1
+        i += 1
+    if quote_count % 2 == 1:
+        text += '"'
+
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Balance brackets and braces
+    opens = 0
+    squares = 0
+    in_string = False
+    for i, ch in enumerate(text):
+        if ch == '"' and (i == 0 or text[i - 1] != '\\'):
+            in_string = not in_string
+        if in_string:
+            continue
+        if ch == '{':
+            opens += 1
+        elif ch == '}':
+            opens -= 1
+        elif ch == '[':
+            squares += 1
+        elif ch == ']':
+            squares -= 1
+
+    # Append missing closers
+    text += ']' * max(0, squares)
+    text += '}' * max(0, opens)
+
+    return text

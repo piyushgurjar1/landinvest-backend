@@ -1,13 +1,12 @@
-import io
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional
-import pandas as pd
+
 from database import get_db, SessionLocal
 from models.user import User
 from models.apn import APNReport
-from models.parcel_data import ParcelData
+from models.batch import BatchJob, BatchItem
 from schemas.apn import APNLookupRequest, APNReportResponse
 from utils.auth import get_current_user
 from gemini_service import analyze_apn
@@ -16,15 +15,18 @@ from gemini_service import analyze_apn
 router = APIRouter(prefix="/api/apn", tags=["APN Reports"])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Single APN endpoints (unchanged logic — only ParcelData references removed)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.get("/check/{apn}")
 def check_apn(
     apn: str,
     db: Session = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """Check if APN exists in parcel_data and if a report already exists."""
+    """Check if a report already exists for this APN."""
     apn = str(apn).replace("-", "").replace(" ", "").strip()
-    parcel = db.query(ParcelData).filter(ParcelData.apn == apn).first()
     existing_report = (
         db.query(APNReport)
         .filter(APNReport.apn == apn, APNReport.status == "completed")
@@ -33,11 +35,8 @@ def check_apn(
     )
 
     return {
-        "has_parcel_data": parcel is not None,
         "has_existing_report": existing_report is not None,
         "existing_report_id": existing_report.id if existing_report else None,
-        "parcel_county": parcel.county if parcel else None,
-        "parcel_state": parcel.state if parcel else None,
     }
 
 
@@ -50,36 +49,24 @@ async def lookup_apn(
     normalized_apn = str(request.apn).replace("-", "").replace(" ", "").strip()
     request.apn = normalized_apn
 
-    # ── Step 1: Quick DB reads (connection is fresh, completes in ms) ──────────
-    parcel_data = db.query(ParcelData).filter(ParcelData.apn == normalized_apn).first()
+    county = request.county or "Unknown"
+    state = request.state or "Unknown"
 
-    county = (parcel_data.county if parcel_data and parcel_data.county else request.county) or "Unknown"
-    state = (parcel_data.state if parcel_data and parcel_data.state else request.state) or "Unknown"
-
-    # Cache all parcel fields we need later — after db.close() the ORM object is detached
-    parcel_address = getattr(parcel_data, "address", None)
-    parcel_lat = getattr(parcel_data, "latitude", None)
-    parcel_lng = getattr(parcel_data, "longitude", None)
-    has_parcel = parcel_data is not None
-
-    # ── Step 2: Release DB connection BEFORE the long Gemini call ───────────────
-    # Gemini takes 5–10 minutes. Cloud DBs kill idle connections after ~5 minutes.
-    # Holding the connection open through the AI call guarantees an SSL drop error.
+    # Release DB before long Gemini call
     db.close()
 
-    # ── Step 3: Run Gemini (no DB connection held during this) ──────────────────
     try:
         report_data = await asyncio.wait_for(
             analyze_apn(
                 request.apn,
                 county,
                 state,
-                parcel_info=parcel_data,
+                parcel_info=None,
                 latitude=request.latitude,
                 longitude=request.longitude,
                 address=request.address,
             ),
-            timeout=660.0,  # 11 minute hard cap — fails cleanly instead of hanging forever
+            timeout=660.0,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -89,20 +76,7 @@ async def lookup_apn(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-    # ── Step 4: Overlay parcel CSV data into the report ─────────────────────────
-    if has_parcel:
-        basic = report_data.get("basic_parcel_info", {})
-        if parcel_address:
-            basic["street_address"] = parcel_address
-        if parcel_lat and parcel_lng:
-            basic["gps_coordinates"] = f"{parcel_lat}, {parcel_lng}"
-            basic["google_maps_link"] = f"https://maps.google.com/?q={parcel_lat},{parcel_lng}"
-            basic["google_satellite_link"] = f"https://maps.google.com/?q={parcel_lat},{parcel_lng}&t=k"
-        report_data["basic_parcel_info"] = basic
-
-    # ── Step 5: Open a FRESH DB session just for the write ──────────────────────
-    # pool_pre_ping ensures this connection is alive before use.
-    # The write itself takes <1 second so no risk of timeout here.
+    # Save with a fresh DB session
     fresh_db = SessionLocal()
     try:
         parcel = report_data.get("basic_parcel_info", {})
@@ -147,6 +121,10 @@ async def lookup_apn(
         fresh_db.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Report retrieval endpoints (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.get("/reports/{report_id}")
 def get_report(
     report_id: int,
@@ -180,7 +158,7 @@ def list_reports(
     search: Optional[str] = Query(None, description="Search by APN"),
     limit: int = Query(10, ge=1, le=100),
 ):
-    """List reports. Optional APN search. Returns recent reports, not user-specific."""
+    """List reports. Optional APN search."""
     query = db.query(APNReport).filter(APNReport.status == "completed")
 
     if search:
@@ -193,3 +171,73 @@ def list_reports(
         .limit(limit)
         .all()
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/batches")
+def list_batches(
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """List recent batch jobs."""
+    return [
+        {
+            "id": b.id,
+            "filename": b.filename,
+            "total_properties": b.total_properties,
+            "processed_count": b.processed_count,
+            "status": b.status,
+            "created_at": str(b.created_at) if b.created_at else None,
+        }
+        for b in (
+            db.query(BatchJob)
+            .order_by(BatchJob.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+    ]
+
+
+@router.get("/batches/{batch_id}")
+def get_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """Get batch detail with all items."""
+    batch = db.query(BatchJob).filter(BatchJob.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    items = (
+        db.query(BatchItem)
+        .filter(BatchItem.batch_id == batch_id)
+        .order_by(BatchItem.id)
+        .all()
+    )
+
+    return {
+        "id": batch.id,
+        "filename": batch.filename,
+        "total_properties": batch.total_properties,
+        "processed_count": batch.processed_count,
+        "status": batch.status,
+        "created_at": str(batch.created_at) if batch.created_at else None,
+        "items": [
+            {
+                "id": item.id,
+                "apn": item.apn,
+                "county": item.county,
+                "state": item.state,
+                "address": item.address,
+                "status": item.status,
+                "report_id": item.report_id,
+                "error_message": item.error_message,
+            }
+            for item in items
+        ],
+    }
