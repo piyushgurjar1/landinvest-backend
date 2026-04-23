@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import engine, Base, SessionLocal
 from routers import auth, apn, csv_upload, chat
 from models.user import User
-from models.parcel_data import ParcelData  # noqa: F401 — ensure table creation
+from models.batch import BatchJob, BatchItem  # noqa: F401 — ensure table creation
 from utils.auth import hash_password
 
 # Create database tables

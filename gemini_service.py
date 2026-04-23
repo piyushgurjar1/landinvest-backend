@@ -45,30 +45,7 @@ from gemini_prompts import (
     generate_structured,
 )
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Connection": "close",
-}
-
-session = requests.Session()
-session.headers.update(HEADERS)
-
 _logger = logging.getLogger(__name__)
-
-_ENRICH_BATCH_SIZE              = 4    
-_ENRICH_DELAY_MIN               = 27   
-_ENRICH_DELAY_MAX               = 40   
-_ENRICH_NULL_BATCH_COOLDOWN_MIN = 60   
-_ENRICH_NULL_BATCH_COOLDOWN_MAX = 120  
-
 
 
 
@@ -870,135 +847,58 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL enrichment via external API
-# Replaces the previous DuckDuckGo scraping approach.
-# POSTs clean_sold_comps + clean_active_listings to the enrichment endpoint
-# and writes the returned URLs back into the items in-place.
+# URL enrichment
+# Delegates to enrich_api which handles session rotation, UA rotation,
+# sequential pacing, and anti-bot resilience internally.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _chunked(seq: list[Any], size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def _norm_enrich_key(address: Any, source: Any) -> tuple[str, str]:
-    return (
-        (address or "").strip().lower(),
-        (source or "").strip().lower(),
-    )
-
-
-def _collect_urls_from_response(data: dict[str, Any]) -> dict[tuple[str, str], list[str]]:
-    buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
-
-    if not isinstance(data, dict):
-        return buckets
-
-    # Shape 1: {"results": [...]}
-    results = data.get("results")
-    if isinstance(results, list):
-        for row in results:
-            if not isinstance(row, dict):
-                continue
-            key = _norm_enrich_key(row.get("address"), row.get("source"))
-            url = row.get("source_url") or row.get("url")
-            if key != ("", "") and url:
-                buckets[key].append(url)
-
-    # Shape 2: {"clean_sold_comps": [...], "clean_active_listings": [...]}
-    for group_key in ("clean_sold_comps", "clean_active_listings"):
-        rows = data.get(group_key)
-        if isinstance(rows, list):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                key = _norm_enrich_key(row.get("address"), row.get("source"))
-                url = row.get("source_url") or row.get("url")
-                if key != ("", "") and url:
-                    buckets[key].append(url)
-
-    return buckets
-
-
 async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
-    from enrich_api import enrich  # direct import — no HTTP, no cold start
+    from enrich_api import enrich
 
     sold_items   = stage2b.get("clean_sold_comps",      [])
     active_items = stage2b.get("clean_active_listings", [])
 
-    tagged_items = []
-    for item in sold_items:
-        if item.get("address") and item.get("source"):
-            tagged_items.append({"kind": "sold",   "item": item})
-    for item in active_items:
-        if item.get("address") and item.get("source"):
-            tagged_items.append({"kind": "active", "item": item})
+    # Build payload — only items with both address and source
+    payload = {
+        "clean_sold_comps": [
+            {"address": it.get("address"), "source": it.get("source")}
+            for it in sold_items if it.get("address") and it.get("source")
+        ],
+        "clean_active_listings": [
+            {"address": it.get("address"), "source": it.get("source")}
+            for it in active_items if it.get("address") and it.get("source")
+        ],
+    }
 
-    if not tagged_items:
+    total = len(payload["clean_sold_comps"]) + len(payload["clean_active_listings"])
+    if total == 0:
         return
 
-    total_batches = (len(tagged_items) + _ENRICH_BATCH_SIZE - 1) // _ENRICH_BATCH_SIZE
+    try:
+        data = await enrich(payload)
+    except Exception as exc:
+        _logger.warning("URL enrichment failed: %s", exc)
+        return
 
-    for batch_index, batch in enumerate(
-        _chunked(tagged_items, _ENRICH_BATCH_SIZE), start=1
-    ):
-        payload = {
-            "clean_sold_comps": [
-                {"address": row["item"].get("address"), "source": row["item"].get("source")}
-                for row in batch if row["kind"] == "sold"
-            ],
-            "clean_active_listings": [
-                {"address": row["item"].get("address"), "source": row["item"].get("source")}
-                for row in batch if row["kind"] == "active"
-            ],
-        }
+    if not data or not isinstance(data, dict):
+        return
 
-        try:
-            data = await enrich(payload)
-        except Exception as exc:
-            _logger.warning(
-                "enrich() failed for batch %s/%s: %s",
-                batch_index, total_batches, exc,
-            )
-            data = None
-
-        if not data:
-            cooldown = random.uniform(
-                _ENRICH_NULL_BATCH_COOLDOWN_MIN, _ENRICH_NULL_BATCH_COOLDOWN_MAX
-            )
-            _logger.warning(
-                "No response for batch %s/%s, cooling down %.2fs",
-                batch_index, total_batches, cooldown,
-            )
-            await asyncio.sleep(cooldown)
+    # Build lookup from results
+    results = data.get("results", [])
+    url_map: dict[str, str] = {}
+    for row in results:
+        if not isinstance(row, dict):
             continue
+        addr = (row.get("address") or "").strip().lower()
+        url = row.get("source_url") or row.get("url")
+        if addr and url:
+            url_map[addr] = url
 
-        url_buckets = _collect_urls_from_response(data)
-        found_count = 0
-
-        for row in batch:
-            item = row["item"]
-            key  = _norm_enrich_key(item.get("address"), item.get("source"))
-            urls = url_buckets.get(key, [])
-            url  = urls.pop(0) if urls else None
-            if url:
-                item["source_url"] = url
-                found_count += 1
-                _logger.info("Enriched URL: %s → %s", item.get("address"), url)
-
-        if found_count == 0:
-            cooldown = random.uniform(
-                _ENRICH_NULL_BATCH_COOLDOWN_MIN, _ENRICH_NULL_BATCH_COOLDOWN_MAX
-            )
-            _logger.warning(
-                "Batch %s/%s returned all null, cooling down %.2fs",
-                batch_index, total_batches, cooldown,
-            )
-            await asyncio.sleep(cooldown)
-        elif batch_index < total_batches:
-            sleep_for = random.uniform(_ENRICH_DELAY_MIN, _ENRICH_DELAY_MAX)
-            _logger.info("Sleeping %.2fs before next batch", sleep_for)
-            await asyncio.sleep(sleep_for)
+    # Write URLs back into original items
+    for item in sold_items + active_items:
+        addr = (item.get("address") or "").strip().lower()
+        if addr and addr in url_map:
+            item["source_url"] = url_map[addr]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
