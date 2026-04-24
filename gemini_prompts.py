@@ -454,7 +454,7 @@ async def generate_structured(
     use_search: bool,
     thinking_level: str,
     max_output_tokens: int = 32000,
-    retries: int = 3,
+    retries: int = 4,
     retry_delay: float = 30.0,   # ✅ 30s base delay — handles Gemini 429 rate limits
 ) -> BaseModel:
     schema_dict = _inline_json_schema_refs(schema_model.model_json_schema())

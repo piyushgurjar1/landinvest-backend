@@ -66,7 +66,7 @@ async def lookup_apn(
                 longitude=request.longitude,
                 address=request.address,
             ),
-            timeout=660.0,
+            timeout=1200.0,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
