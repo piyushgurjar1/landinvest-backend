@@ -1,6 +1,7 @@
 import io
 import asyncio
 import logging
+import random
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 import pandas as pd
@@ -147,8 +148,17 @@ async def _run_batch_analysis(batch_id: int):
         _safe_update_batch_status(batch_id, "completed")
         return
 
-    # 2. Process each item with its own DB session
-    for item_id in item_ids:
+    # 2. Process each item with its own DB session — with cooling delays
+    for idx, item_id in enumerate(item_ids):
+        # Randomized delay between APNs (1–2 min) to avoid rate limits
+        if idx > 0:
+            delay = random.uniform(60.0, 120.0)
+            _logger.info(
+                "Batch %s: cooling %.0fs before item %d/%d",
+                batch_id, delay, idx + 1, len(item_ids),
+            )
+            await asyncio.sleep(delay)
+
         await _process_single_batch_item(batch_id, item_id)
 
     # 3. Mark batch as completed (always — even if some items failed)
@@ -180,26 +190,36 @@ async def _process_single_batch_item(batch_id: int, item_id: int):
     finally:
         _safe_close(db)
 
-    # Run analysis (NO db session held during this long operation)
+    # Run analysis with retry + exponential backoff (NO db session held)
     report_data = None
     error_message = None
-    try:
-        report_data = await asyncio.wait_for(
-            analyze_apn(
-                apn, county, state,
-                parcel_info=None,
-                latitude=latitude,
-                longitude=longitude,
-                address=address,
-            ),
-            timeout=660.0,
-        )
-    except asyncio.TimeoutError:
-        error_message = "Analysis timed out after 11 minutes"
-        _logger.error("Batch item %s (APN %s) timed out", item_id, apn)
-    except Exception as e:
-        error_message = str(e)[:500]
-        _logger.error("Batch item %s (APN %s) failed: %s", item_id, apn, e)
+    max_attempts = 3
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            report_data = await asyncio.wait_for(
+                analyze_apn(
+                    apn, county, state,
+                    parcel_info=None,
+                    latitude=latitude,
+                    longitude=longitude,
+                    address=address,
+                ),
+                timeout=660.0,
+            )
+            break  # success — exit retry loop
+        except asyncio.TimeoutError:
+            error_message = "Analysis timed out after 11 minutes"
+            _logger.error("Batch item %s (APN %s) timed out (attempt %d/%d)", item_id, apn, attempt, max_attempts)
+        except Exception as e:
+            error_message = str(e)[:500]
+            _logger.error("Batch item %s (APN %s) failed (attempt %d/%d): %s", item_id, apn, attempt, max_attempts, e)
+
+        # Retry backoff (skip if last attempt)
+        if attempt < max_attempts:
+            backoff = random.uniform(30, 60) * attempt
+            _logger.info("Retrying batch item %s in %.0fs...", item_id, backoff)
+            await asyncio.sleep(backoff)
 
     # Write results with a FRESH session
     db = SessionLocal()
