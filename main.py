@@ -17,11 +17,17 @@ app = FastAPI(
 )
 
 
-# Create demo user on startup
+import asyncio
+from models.apn import APNReport
+from routers.csv_upload import _run_batch_analysis
+from routers.apn import _run_single_analysis
+
+# Create demo user and recover stalled tasks on startup
 @app.on_event("startup")
-def create_demo_user():
+async def startup_event():
     db = SessionLocal()
     try:
+        # 1. Create demo user
         demo_email = os.getenv("DEMO_EMAIL", "demo@gmail.com")
         demo_password = os.getenv("DEMO_PASSWORD", "landinvestai")
         demo_name = os.getenv("DEMO_NAME", "Demo User")
@@ -38,6 +44,38 @@ def create_demo_user():
             print(f"✅ Demo user created: {demo_email} / {demo_password}")
         else:
             print(f"✅ Demo user exists: {demo_email} / {demo_password}")
+
+        # 2. Recover stalled batches
+        stalled_items = db.query(BatchItem).filter(BatchItem.status == "processing").all()
+        recovered_batches = set()
+        for item in stalled_items:
+            item.status = "pending"
+            recovered_batches.add(item.batch_id)
+        if stalled_items:
+            db.commit()
+            print(f"✅ Recovered {len(stalled_items)} stalled batch items to pending")
+
+        # Start a background task for any batch that is still processing
+        stalled_batches = db.query(BatchJob).filter(BatchJob.status == "processing").all()
+        for batch in stalled_batches:
+            print(f"✅ Auto-resuming stalled batch: {batch.id}")
+            asyncio.create_task(_run_batch_analysis(batch.id))
+
+        # 3. Recover stalled single APN lookups
+        stalled_reports = db.query(APNReport).filter(APNReport.status == "processing").all()
+        for report in stalled_reports:
+            print(f"✅ Auto-resuming stalled single APN lookup: {report.apn}")
+            report.status = "queued"
+            # Launch exactly what background_tasks.add_task does
+            asyncio.create_task(_run_single_analysis(
+                report.id, report.apn, report.county, report.state,
+                None, None, report.address
+            ))
+        if stalled_reports:
+            db.commit()
+
+    except Exception as e:
+        print(f"❌ Error during startup recovery: {e}")
     finally:
         db.close()
 

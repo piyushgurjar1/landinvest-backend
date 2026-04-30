@@ -205,7 +205,7 @@ async def _process_single_batch_item(batch_id: int, item_id: int):
                     longitude=longitude,
                     address=address,
                 ),
-                timeout=660.0,
+                timeout=1200.0,
             )
             break  # success — exit retry loop
         except asyncio.TimeoutError:
