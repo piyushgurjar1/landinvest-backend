@@ -892,7 +892,7 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
         if not isinstance(row, dict):
             continue
         addr = (row.get("address") or "").strip().lower()
-        url = row.get("source_url") or row.get("url")
+        url  = row.get("source_url") or row.get("url")
         if addr and url:
             url_map[addr] = url
 
