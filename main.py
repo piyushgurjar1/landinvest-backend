@@ -18,16 +18,29 @@ app = FastAPI(
 
 
 import asyncio
+from sqlalchemy import text
 from models.apn import APNReport
 from routers.csv_upload import _run_batch_analysis
 from routers.apn import _run_single_analysis
 
-# Create demo user and recover stalled tasks on startup
+# Create demo user, run migrations, and recover stalled tasks on startup
 @app.on_event("startup")
 async def startup_event():
+    # 0. DB migrations — add columns if missing
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE \"Users-prod\" ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'user'"))
+            conn.execute(text("ALTER TABLE \"Users-prod\" ADD COLUMN IF NOT EXISTS is_approved BOOLEAN DEFAULT FALSE"))
+            # Auto-approve all existing users (prevent lockout)
+            conn.execute(text("UPDATE \"Users-prod\" SET is_approved = TRUE WHERE is_approved IS NULL OR is_approved = FALSE"))
+            conn.commit()
+            print("✅ User table migration complete")
+        except Exception as e:
+            print(f"⚠️ User migration note: {e}")
+
     db = SessionLocal()
     try:
-        # 1. Create demo user
+        # 1. Create / update demo user
         demo_email = os.getenv("DEMO_EMAIL", "demo@gmail.com")
         demo_password = os.getenv("DEMO_PASSWORD", "landinvestai")
         demo_name = os.getenv("DEMO_NAME", "Demo User")
@@ -38,12 +51,18 @@ async def startup_event():
                 email=demo_email,
                 password=hash_password(demo_password),
                 name=demo_name,
+                role="admin",
+                is_approved=True,
             )
             db.add(user)
             db.commit()
-            print(f"✅ Demo user created: {demo_email} / {demo_password}")
+            print(f"✅ Demo admin created: {demo_email} / {demo_password}")
         else:
-            print(f"✅ Demo user exists: {demo_email} / {demo_password}")
+            # Ensure demo user is admin and approved
+            existing.role = "admin"
+            existing.is_approved = True
+            db.commit()
+            print(f"✅ Demo admin exists: {demo_email} / {demo_password}")
 
         # 2. Recover stalled batches
         stalled_items = db.query(BatchItem).filter(BatchItem.status == "processing").all()
@@ -66,7 +85,6 @@ async def startup_event():
         for report in stalled_reports:
             print(f"✅ Auto-resuming stalled single APN lookup: {report.apn}")
             report.status = "queued"
-            # Launch exactly what background_tasks.add_task does
             asyncio.create_task(_run_single_analysis(
                 report.id, report.apn, report.county, report.state,
                 None, None, report.address

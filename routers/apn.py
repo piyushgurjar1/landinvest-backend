@@ -287,22 +287,63 @@ def list_batches(
     limit: int = Query(10, ge=1, le=50),
 ):
     """List recent batch jobs."""
-    return [
-        {
+    batches = db.query(BatchJob).order_by(BatchJob.created_at.desc()).limit(limit).all()
+    results = []
+    for b in batches:
+        # Dynamically calculate accurate processed count
+        processed = db.query(BatchItem).filter(
+            BatchItem.batch_id == b.id,
+            BatchItem.status.in_(["completed", "failed"])
+        ).count()
+        results.append({
             "id": b.id,
             "filename": b.filename,
             "total_properties": b.total_properties,
-            "processed_count": b.processed_count,
+            "processed_count": processed,
             "status": b.status,
             "created_at": str(b.created_at) if b.created_at else None,
-        }
-        for b in (
-            db.query(BatchJob)
-            .order_by(BatchJob.created_at.desc())
-            .limit(limit)
-            .all()
-        )
-    ]
+        })
+    return results
+
+
+@router.post("/batches/{batch_id}/retry-failed")
+async def retry_failed_items(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """Retry all failed items in a batch. Resets them to pending and re-runs."""
+    batch = db.query(BatchJob).filter(BatchJob.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    failed_items = (
+        db.query(BatchItem)
+        .filter(BatchItem.batch_id == batch_id, BatchItem.status.in_(["failed", "pending"]))
+        .all()
+    )
+
+    if not failed_items:
+        raise HTTPException(status_code=400, detail="No failed items to retry")
+
+    # Reset failed items to pending
+    count = 0
+    for item in failed_items:
+        item.status = "pending"
+        item.error_message = None
+        count += 1
+
+    # Subtract retried items from processed_count so progress bar rewinds properly
+    batch.processed_count = max(0, batch.processed_count - count)
+    batch.status = "processing"
+    db.commit()
+
+    # Launch background re-processing
+    import asyncio
+    from routers.csv_upload import _run_batch_analysis
+    asyncio.create_task(_run_batch_analysis(batch_id))
+
+    return {"message": f"Retrying {count} failed items", "count": count}
 
 
 @router.get("/batches/{batch_id}")
@@ -311,7 +352,7 @@ def get_batch(
     db: Session = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """Get batch detail with all items."""
+    """Get batch detail with all items and report metrics."""
     batch = db.query(BatchJob).filter(BatchJob.id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
@@ -323,6 +364,35 @@ def get_batch(
         .all()
     )
 
+    # Pre-load report data for completed items
+    report_ids = [item.report_id for item in items if item.report_id]
+    reports_map = {}
+    if report_ids:
+        reports = db.query(APNReport).filter(APNReport.id.in_(report_ids)).all()
+        reports_map = {r.id: r for r in reports}
+
+    items_data = []
+    for item in items:
+        row = {
+            "id": item.id,
+            "apn": item.apn,
+            "county": item.county,
+            "state": item.state,
+            "address": item.address,
+            "status": item.status,
+            "report_id": item.report_id,
+            "error_message": item.error_message,
+            "deal_score": None,
+            "bid_ceiling": None,
+            "estimated_market_value": None,
+        }
+        if item.report_id and item.report_id in reports_map:
+            report = reports_map[item.report_id]
+            row["deal_score"] = report.deal_score
+            row["bid_ceiling"] = report.bid_ceiling
+            row["estimated_market_value"] = report.estimated_market_value
+        items_data.append(row)
+
     return {
         "id": batch.id,
         "filename": batch.filename,
@@ -330,17 +400,5 @@ def get_batch(
         "processed_count": batch.processed_count,
         "status": batch.status,
         "created_at": str(batch.created_at) if batch.created_at else None,
-        "items": [
-            {
-                "id": item.id,
-                "apn": item.apn,
-                "county": item.county,
-                "state": item.state,
-                "address": item.address,
-                "status": item.status,
-                "report_id": item.report_id,
-                "error_message": item.error_message,
-            }
-            for item in items
-        ],
+        "items": items_data,
     }
