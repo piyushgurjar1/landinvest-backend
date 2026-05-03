@@ -84,8 +84,8 @@ def list_all_users(
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_admin),
 ):
-    """List all users."""
-    users = db.query(User).order_by(User.id).all()
+    """List all approved users."""
+    users = db.query(User).filter(User.is_approved == True).order_by(User.id).all()
     return [
         {
             "id": u.id,
