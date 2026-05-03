@@ -360,15 +360,16 @@ Subject parcel:
 - Acreage: {acreage}
 - Zoning: {zoning_code}
 
-Search sources (STRICT RESTRICTION):
+Search priority:
 1. Realtor land sold
 2. Zillow sold land + active land
 3. Land.com sold + active
 4. Redfin sold land
 5. LandWatch sold + active
+6. AcreValue / county parcel sales / recorder if available
+7. Regrid / parcel portals if useful
 
 Rules:
-- ONLY fetch properties from the 5 exact sites listed above. Do NOT fetch any property apart from these sites.
 - Vacant land only
 - Exclude homes, cabins, manufactured homes, mobile homes, barns, improved parcels,
   or parcels whose value is obviously driven by installed well/septic/utilities
