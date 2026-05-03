@@ -441,10 +441,12 @@ def _make_config(
         tools=tools,
     )
 
-    if response_schema is not None:
+    # Disable strict JSON mode if tools are being used
+    if response_schema is not None and not use_search:
         kwargs["response_mime_type"] = "application/json"
         kwargs["response_schema"] = response_schema
-
+    
+    # If using search, we rely on the prompt instructions to get JSON
     return types.GenerateContentConfig(**kwargs)
 
 
