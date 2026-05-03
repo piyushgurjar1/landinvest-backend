@@ -1,8 +1,7 @@
+# gemini_prompts.py
 from __future__ import annotations
 
 import os
-import re
-import json
 import copy
 import asyncio
 import logging
@@ -18,39 +17,24 @@ load_dotenv()
 _logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")  # ✅ valid model name
+
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ── Model chain ───────────────────────────────────────────────────────────────
-# gemini-2.5-flash-preview-04-17 supports thinking_level + tools + response_schema together.
-# gemini-2.5-flash is stable but has the TOO_MANY_TOOL_CALLS + schema conflict restrictions.
-MODEL_PRIMARY  = os.getenv("GEMINI_MODEL_PRIMARY",  "gemini-2.5-flash-preview-04-17")
-MODEL_FALLBACK = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-2.5-flash")
-
-# ── Thinking levels per stage ─────────────────────────────────────────────────
+# Thinking levels per stage
 THINKING_STAGE1A = "low"
 THINKING_STAGE1B = "low"
 THINKING_STAGE1C = "medium"
 THINKING_STAGE1D = "low"
 THINKING_STAGE2  = "medium"
 
-# ── Per-stage timeout ─────────────────────────────────────────────────────────
-_STAGE_TIMEOUT = 300.0  # 5 minutes per stage call
-
-# ── AFC remote call cap ───────────────────────────────────────────────────────
-# Caps internal Google Search grounding calls to prevent TOO_MANY_TOOL_CALLS.
-_AFC_MAX_REMOTE_CALLS = int(os.getenv("GEMINI_AFC_MAX_REMOTE_CALLS", "5"))
-
-# ── Finish reasons treated as empty/incomplete responses ──────────────────────
-_EMPTY_FINISH_REASONS = {"UNKNOWN", "TOO_MANY_TOOL_CALLS"}
-
-# ── Models that use thinking_budget instead of thinking_level ─────────────────
-_THINKING_LEVEL_UNSUPPORTED = {"gemini-2.5-flash", "gemini-2.5-flash-latest"}
-
-# ── Models that do NOT allow tools + response_mime_type together ──────────────
-_TOOLS_SCHEMA_CONFLICT = {"gemini-2.5-flash", "gemini-2.5-flash-latest"}
+# ── Per-stage timeout (seconds) ───────────────────────────────────────────────
+# Each individual Gemini call gets its own timeout.
+# If a stage exceeds this, it raises TimeoutError → retried or failed cleanly.
+_STAGE_TIMEOUT = 300.0  # 3 minutes per stage call
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,20 +426,7 @@ def _inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def _thinking_config_for_model(model: str, thinking_level: str) -> types.ThinkingConfig:
-    """
-    gemini-2.5-flash-preview-04-17 → uses thinking_level ("low" / "medium" / "high")
-    gemini-2.5-flash               → uses thinking_budget (integer tokens)
-    """
-    if model in _THINKING_LEVEL_UNSUPPORTED:
-        budget_map = {"low": 1024, "medium": 8192, "high": 24576}
-        budget = budget_map.get(thinking_level, 1024)
-        return types.ThinkingConfig(thinking_budget=budget)
-    return types.ThinkingConfig(thinking_level=thinking_level)
-
-
 def _make_config(
-    model: str,
     use_search: bool,
     thinking_level: str,
     response_schema: Optional[dict[str, Any]] = None,
@@ -463,137 +434,19 @@ def _make_config(
 ) -> types.GenerateContentConfig:
     tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else []
 
-    kwargs: dict[str, Any] = dict(
+    kwargs = dict(
         temperature=0.0,
         max_output_tokens=max_output_tokens,
-        thinking_config=_thinking_config_for_model(model, thinking_level),
+        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
         tools=tools,
     )
 
-    # Cap AFC remote calls when search is active to prevent TOO_MANY_TOOL_CALLS.
-    if use_search:
-        kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
-            maximum_remote_calls=_AFC_MAX_REMOTE_CALLS
-        )
-
-    can_use_schema_with_tools = model not in _TOOLS_SCHEMA_CONFLICT
-
     if response_schema is not None:
-        if can_use_schema_with_tools or not use_search:
-            kwargs["response_mime_type"] = "application/json"
-            kwargs["response_schema"] = response_schema
-        # else: schema will be injected into prompt text by the caller
+        kwargs["response_mime_type"] = "application/json"
+        kwargs["response_schema"] = response_schema
 
     return types.GenerateContentConfig(**kwargs)
 
-
-def _inject_schema_into_prompt(prompt: str, schema_dict: dict[str, Any]) -> str:
-    """
-    Embeds the JSON schema into the prompt text when the model cannot use
-    response_schema + tools simultaneously (gemini-2.5-flash restriction).
-    """
-    schema_str = json.dumps(schema_dict, indent=2)
-    return (
-        f"{prompt}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "OUTPUT FORMAT — MANDATORY\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Your FINAL response must be a single valid JSON object.\n"
-        "Do NOT include any text, explanation, or markdown before or after the JSON.\n"
-        "Do NOT wrap in ```json code fences.\n"
-        "Start your response directly with { and end with }.\n"
-        "The JSON must exactly match this schema:\n\n"
-        f"{schema_str}"
-    )
-
-
-def _extract_json_from_text(text: str) -> str:
-    """
-    When schema is injected into the prompt, Gemini may still prepend explanation
-    text or wrap in code fences. This strips all that and returns only the JSON.
-    """
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-        text = text.strip()
-    for i, ch in enumerate(text):
-        if ch in ('{', '['):
-            return text[i:]
-    return text
-
-
-def _repair_json(text: str) -> str:
-    """Best-effort repair of truncated / malformed JSON from Gemini."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-        text = text.strip()
-
-    # Remove trailing commas before } or ]
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-
-    # Close any unclosed string
-    quote_count = sum(
-        1 for i, ch in enumerate(text)
-        if ch == '"' and (i == 0 or text[i - 1] != '\\')
-    )
-    if quote_count % 2 == 1:
-        text += '"'
-
-    # Balance brackets and braces
-    opens = squares = 0
-    in_string = False
-    for i, ch in enumerate(text):
-        if ch == '"' and (i == 0 or text[i - 1] != '\\'):
-            in_string = not in_string
-        if in_string:
-            continue
-        if ch == '{':     opens += 1
-        elif ch == '}':   opens -= 1
-        elif ch == '[':   squares += 1
-        elif ch == ']':   squares -= 1
-
-    text += ']' * max(0, squares)
-    text += '}' * max(0, opens)
-    return text
-
-
-def _parse_response(
-    text: str,
-    schema_model: Type[BaseModel],
-    attempt: int,
-    retries: int,
-    used_schema_injection: bool,
-) -> BaseModel:
-    """Try direct parse → extract JSON → repair → raise."""
-    if used_schema_injection:
-        text = _extract_json_from_text(text)
-
-    try:
-        return schema_model.model_validate_json(text)
-    except Exception as parse_err:
-        _logger.warning(
-            "Direct JSON parse failed (attempt %d/%d): %s — trying repair",
-            attempt, retries, parse_err,
-        )
-
-    repaired = _repair_json(text)
-    try:
-        return schema_model.model_validate_json(repaired)
-    except Exception as repair_err:
-        raise ValueError(f"JSON repair also failed: {repair_err}") from repair_err
-
-
-def _is_empty_response(finish_reason: str) -> bool:
-    """Returns True for finish reasons that always produce empty text."""
-    return finish_reason in _EMPTY_FINISH_REASONS
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core generation function — with automatic model fallback
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_structured(
     prompt: str,
@@ -602,123 +455,62 @@ async def generate_structured(
     thinking_level: str,
     max_output_tokens: int = 32000,
     retries: int = 3,
-    retry_delay: float = 30.0,
+    retry_delay: float = 30.0,   # ✅ 30s base delay — handles Gemini 429 rate limits
 ) -> BaseModel:
-    """
-    Attempt 1  → MODEL_PRIMARY  with search (gemini-2.5-flash-preview-04-17)
-                 Full native schema support + thinking_level + tools.
-
-    Attempt 2  → MODEL_FALLBACK with search + AFC capped (gemini-2.5-flash)
-                 Schema injected into prompt (tools+schema conflict workaround).
-                 AFC capped at _AFC_MAX_REMOTE_CALLS to prevent TOO_MANY_TOOL_CALLS.
-
-    Attempt 3  → MODEL_FALLBACK WITHOUT search (last resort escape hatch)
-                 Disables grounding entirely to guarantee a valid response.
-                 Uses native response_schema since tools are off.
-    """
     schema_dict = _inline_json_schema_refs(schema_model.model_json_schema())
-    last_error: Optional[Exception] = None
+    last_error = None
 
     for attempt in range(1, retries + 1):
-        # ── Model + search mode selection ─────────────────────────────────────
-        if attempt == 1:
-            model         = MODEL_PRIMARY
-            search_active = use_search
-        elif attempt == 2:
-            model         = MODEL_FALLBACK
-            search_active = use_search          # try with search + AFC cap
-        else:
-            # Attempt 3+: disable search entirely to escape TOO_MANY_TOOL_CALLS
-            model         = MODEL_FALLBACK
-            search_active = False
-            _logger.warning(
-                "Gemini attempt %d/%d — disabling search to escape TOO_MANY_TOOL_CALLS | model=%s",
-                attempt, retries, model,
-            )
-
-        # ── Schema injection needed for gemini-2.5-flash when search is on ───
-        needs_schema_injection = (model in _TOOLS_SCHEMA_CONFLICT and search_active)
-
-        if needs_schema_injection:
-            full_prompt      = _inject_schema_into_prompt(prompt, schema_dict)
-            effective_schema = None   # NOT passed to config — embedded in prompt instead
-        else:
-            full_prompt      = prompt
-            effective_schema = schema_dict
-
         try:
             config = _make_config(
-                model=model,
-                use_search=search_active,
+                use_search=use_search,
                 thinking_level=thinking_level,
-                response_schema=effective_schema,
+                response_schema=schema_dict,
                 max_output_tokens=max_output_tokens,
             )
 
-            _logger.info(
-                "Gemini request | attempt=%d/%d | model=%s | search=%s | thinking=%s | schema_injection=%s",
-                attempt, retries, model, search_active, thinking_level, needs_schema_injection,
-            )
-
+            # ✅ Per-stage timeout — each Gemini call has its own timeout
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
-                    model=model,
-                    contents=full_prompt,
+                    model=MODEL,
+                    contents=prompt,
                     config=config,
                 ),
                 timeout=_STAGE_TIMEOUT,
             )
 
-            # ── Inspect finish reason ─────────────────────────────────────────
-            candidate     = response.candidates[0] if response.candidates else None
-            finish_reason = candidate.finish_reason.name if candidate else "UNKNOWN"
-
-            if finish_reason == "MAX_TOKENS":
-                _logger.warning(
-                    "Gemini hit MAX_TOKENS | attempt=%d/%d | model=%s — attempting JSON repair",
-                    attempt, retries, model,
-                )
-
-            # TOO_MANY_TOOL_CALLS always yields empty text — treat as empty response
             text = (response.text or "").strip()
+            if not text:
+                raise ValueError("Gemini returned empty response")
 
-            if not text or _is_empty_response(finish_reason):
-                raise ValueError(
-                    f"Gemini returned empty response (model={model}, finish_reason={finish_reason})"
+            _logger.info("Gemini stage completed (attempt %d/%d)", attempt, retries)
+
+            # Try direct parse first
+            try:
+                return schema_model.model_validate_json(text)
+            except Exception as parse_err:
+                # Attempt JSON repair on truncated / malformed responses
+                _logger.warning(
+                    "Direct JSON parse failed (attempt %d/%d): %s — trying repair",
+                    attempt, retries, parse_err,
                 )
-
-            _logger.info(
-                "Gemini response received | attempt=%d/%d | model=%s | chars=%d | finish=%s",
-                attempt, retries, model, len(text), finish_reason,
-            )
-
-            result = _parse_response(
-                text=text,
-                schema_model=schema_model,
-                attempt=attempt,
-                retries=retries,
-                used_schema_injection=needs_schema_injection,
-            )
-
-            _logger.info(
-                "Gemini stage completed successfully | attempt=%d/%d | model=%s",
-                attempt, retries, model,
-            )
-            return result
+                repaired = _repair_json(text)
+                try:
+                    return schema_model.model_validate_json(repaired)
+                except Exception as repair_err:
+                    raise ValueError(
+                        f"JSON repair also failed: {repair_err}"
+                    ) from parse_err
 
         except asyncio.TimeoutError:
             last_error = TimeoutError(f"Gemini stage timed out after {_STAGE_TIMEOUT}s")
-            _logger.warning(
-                "Gemini timeout | attempt=%d/%d | model=%s", attempt, retries, model
-            )
+            _logger.warning("Gemini timeout on attempt %d/%d", attempt, retries)
             if attempt < retries:
                 await asyncio.sleep(10.0)
 
         except Exception as e:
             last_error = e
-            _logger.warning(
-                "Gemini error | attempt=%d/%d | model=%s | error=%s", attempt, retries, model, e
-            )
+            _logger.warning("Gemini error on attempt %d/%d: %s", attempt, retries, e)
             if attempt < retries:
                 wait = retry_delay * attempt
                 _logger.info("Retrying in %.0fs...", wait)
@@ -727,3 +519,52 @@ async def generate_structured(
     raise RuntimeError(
         f"Gemini structured call failed after {retries} attempts: {last_error}"
     )
+
+
+def _repair_json(text: str) -> str:
+    """Best-effort repair of truncated / malformed JSON from Gemini."""
+    import re
+
+    # Strip markdown code fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
+
+    # Close any unclosed string (odd number of unescaped quotes)
+    quote_count = 0
+    i = 0
+    while i < len(text):
+        if text[i] == '"' and (i == 0 or text[i - 1] != '\\'):
+            quote_count += 1
+        i += 1
+    if quote_count % 2 == 1:
+        text += '"'
+
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Balance brackets and braces
+    opens = 0
+    squares = 0
+    in_string = False
+    for i, ch in enumerate(text):
+        if ch == '"' and (i == 0 or text[i - 1] != '\\'):
+            in_string = not in_string
+        if in_string:
+            continue
+        if ch == '{':
+            opens += 1
+        elif ch == '}':
+            opens -= 1
+        elif ch == '[':
+            squares += 1
+        elif ch == ']':
+            squares -= 1
+
+    # Append missing closers
+    text += ']' * max(0, squares)
+    text += '}' * max(0, opens)
+
+    return text
