@@ -434,19 +434,23 @@ def _make_config(
 ) -> types.GenerateContentConfig:
     tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else []
 
+    # Initialize basic kwargs
     kwargs = dict(
         temperature=0.0,
         max_output_tokens=max_output_tokens,
-        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
         tools=tools,
     )
 
-    # Disable strict JSON mode if tools are being used
+    # ✅ ONLY add thinking_config if using a Gemini 3 model
+    # Gemini 2.5 does NOT support this and will throw a 400 error.
+    if "gemini-3" in MODEL:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+
+    # ✅ Fix the previous error: Don't use strict JSON mode if Search is enabled
     if response_schema is not None and not use_search:
         kwargs["response_mime_type"] = "application/json"
         kwargs["response_schema"] = response_schema
-    
-    # If using search, we rely on the prompt instructions to get JSON
+
     return types.GenerateContentConfig(**kwargs)
 
 
