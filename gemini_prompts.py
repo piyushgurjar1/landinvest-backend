@@ -431,14 +431,24 @@ def _make_config(
     thinking_level: str,
     response_schema: Optional[dict[str, Any]] = None,
     max_output_tokens: int = 62000,
+    temperature: float = 0.0,
 ) -> types.GenerateContentConfig:
     tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else []
 
+    # Disable ALL safety filters to avoid empty responses on land/property content
+    safety_settings = [
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+    ]
+
     kwargs = dict(
-        temperature=0.0,
+        temperature=temperature,
         max_output_tokens=max_output_tokens,
         thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
         tools=tools,
+        safety_settings=safety_settings,
     )
 
     if response_schema is not None:
@@ -454,22 +464,27 @@ async def generate_structured(
     use_search: bool,
     thinking_level: str,
     max_output_tokens: int = 32000,
-    retries: int = 3,
-    retry_delay: float = 30.0,   # ✅ 30s base delay — handles Gemini 429 rate limits
+    retries: int = 5,
+    retry_delay: float = 30.0,
 ) -> BaseModel:
     schema_dict = _inline_json_schema_refs(schema_model.model_json_schema())
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
+            # Fall back to disabling search and raising temperature to avoid API crashes
+            current_use_search = use_search if attempt <= 2 else False
+            current_temp = 0.0 if attempt == 1 else 0.2
+
             config = _make_config(
-                use_search=use_search,
+                use_search=current_use_search,
                 thinking_level=thinking_level,
                 response_schema=schema_dict,
                 max_output_tokens=max_output_tokens,
+                temperature=current_temp,
             )
 
-            # ✅ Per-stage timeout — each Gemini call has its own timeout
+            # Per-stage timeout — each Gemini call has its own timeout
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=MODEL,
@@ -479,9 +494,21 @@ async def generate_structured(
                 timeout=_STAGE_TIMEOUT,
             )
 
+            # Check for blocked / empty responses
+            if not response or not response.candidates:
+                # Log the entire response to see WHY it's empty
+                _logger.warning("Gemini empty candidates. Raw response: %s", repr(response))
+                try:
+                    _logger.warning("Response dict: %s", response.model_dump())
+                except:
+                    pass
+                raise ValueError(f"Gemini returned no candidates (possible safety block). Response: {repr(response)}")
+
             text = (response.text or "").strip()
             if not text:
-                raise ValueError("Gemini returned empty response")
+                # Try to get finish reason for debugging
+                finish_reason = getattr(response.candidates[0], "finish_reason", "unknown") if response.candidates else "no_candidates"
+                raise ValueError(f"Gemini returned empty text (finish_reason={finish_reason})")
 
             _logger.info("Gemini stage completed (attempt %d/%d)", attempt, retries)
 

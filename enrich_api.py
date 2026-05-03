@@ -1,156 +1,257 @@
-"""
-URL enrichment via DuckDuckGo HTML scraping.
-
-Design for anti-bot resilience:
-- Fresh requests.Session per lookup (no cookie accumulation across queries)
-- Rotating User-Agent pool (avoids fingerprinting)
-- Strictly sequential processing (no concurrent bursts)
-- Exponential backoff on failures
-- Jittered delays between requests to look human
-"""
-
 import asyncio
 import logging
-import random
-import time
+import os
+import re
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, parse_qs
+from requests.exceptions import ConnectTimeout, ReadTimeout, RequestException
 
 _logger = logging.getLogger(__name__)
 
-# ── User-Agent rotation pool ─────────────────────────────────────────────────
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+
+# ---------------------------------------------------------------------------
+# Serper API config  (replaces all DDG env vars)
+# ---------------------------------------------------------------------------
+SERPER_API_KEY      = os.getenv("SERPER_API_KEY", "27377e7bc4e37f9fd4cd11051fdc61bae97c11a6")
+SERPER_API_ENDPOINT = os.getenv("SERPER_API_URL", "https://google.serper.dev/search")
+SERPER_TIMEOUT      = float(os.getenv("SERPER_TIMEOUT", "30"))
+SERPER_NUM_RESULTS  = int(os.getenv("SERPER_NUM_RESULTS", "10"))
+_MIN_RESULT_SCORE   = int(os.getenv("SERPER_MIN_RESULT_SCORE", "60"))
 
 
-def _make_session() -> requests.Session:
-    """Create a fresh session with randomized headers. No cookie carryover."""
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": random.choice(_USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": random.choice([
-            "en-US,en;q=0.9",
-            "en-US,en;q=0.8",
-            "en-GB,en;q=0.9,en-US;q=0.8",
-        ]),
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "close",  # don't keep connections alive
-        "Cache-Control": "no-cache",
-        "DNT": "1",
-    })
-    return s
+# ---------------------------------------------------------------------------
+# Domain helpers  (unchanged)
+# ---------------------------------------------------------------------------
+def _normalize_domain(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = value.replace("https://", "").replace("http://", "")
+    value = value.replace("www.", "").strip("/")
+    return value
 
 
-def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-    """Fetch a property URL from DuckDuckGo HTML search.
+def _source_domain_variants(source: str) -> List[str]:
+    cleaned = _normalize_domain(source)
+    variants = set()
 
-    Uses a FRESH session per call (no cookie accumulation).
-    Retries up to 3 times with exponential backoff.
-    """
-    query = f"{address.strip()} {source.strip()}"
-    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-    target = source.lower().replace(" ", "").replace(".com", "").replace("www.", "")
+    if cleaned:
+        variants.add(cleaned)
+    if cleaned and "." not in cleaned:
+        variants.add(f"{cleaned}.com")
 
-    for attempt in range(3):
-        sess = _make_session()  # fresh session every attempt
-        try:
-            res = sess.get(url, timeout=15)
+    alias_map = {
+        "zillow":      {"zillow.com"},
+        "zillow.com":  {"zillow.com"},
+        "realtor":     {"realtor.com"},
+        "realtor.com": {"realtor.com"},
+        "redfin":      {"redfin.com"},
+        "redfin.com":  {"redfin.com"},
+        "trulia":      {"trulia.com"},
+        "trulia.com":  {"trulia.com"},
+        "homes":       {"homes.com"},
+        "homes.com":   {"homes.com"},
+    }
 
-            if res.status_code == 202 or res.status_code == 403:
-                # DDG rate-limiting or blocking — back off hard
-                wait = random.uniform(5.0 * (attempt + 1), 10.0 * (attempt + 1))
-                _logger.warning(
-                    "DDG returned %s for '%s' (attempt %d), backing off %.1fs",
-                    res.status_code, address, attempt + 1, wait,
-                )
-                time.sleep(wait)
-                continue
+    for variant in list(variants):
+        variants.update(alias_map.get(variant, set()))
 
-            if res.status_code != 200:
-                _logger.debug("DDG status %s for '%s'", res.status_code, address)
-                time.sleep(random.uniform(2.0, 5.0))
-                continue
+    return sorted({v.replace("www.", "") for v in variants if v})
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            results = soup.select("a.result__a")
 
-            if not results:
-                # Could be a CAPTCHA page or empty results
-                _logger.debug("No DDG results for '%s' (attempt %d)", address, attempt + 1)
-                time.sleep(random.uniform(3.0, 6.0))
-                continue
+def _tokenize_address(address: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9]+", (address or "").lower())
+    ignore = {
+        "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "ln", "lane",
+        "ct", "court", "ter", "terrace", "blvd", "boulevard", "cir", "circle",
+        "port", "charlotte", "fl",
+    }
+    return [t for t in tokens if (t.isdigit() or len(t) >= 4) and t not in ignore]
 
-            for a in results:
-                raw = a.get("href")
-                if not raw:
-                    continue
 
-                full_url = urljoin("https://duckduckgo.com", raw)
-                parsed = urlparse(full_url)
-                actual_url = parse_qs(parsed.query).get("uddg", [None])[0]
+# ---------------------------------------------------------------------------
+# Scoring  (unchanged logic — now fed from Serper JSON)
+# ---------------------------------------------------------------------------
+def _score_candidate(url: str, title: str, snippet: str, address: str, source: str) -> int:
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace("www.", "")
+    path   = parsed.path.lower()
 
-                if not actual_url:
-                    continue
+    score = 0
+    source_domains = _source_domain_variants(source)
 
-                domain = urlparse(actual_url).netloc.lower()
-                if target in domain:
-                    return actual_url
+    if domain in source_domains:
+        score += 70
+    elif any(domain.endswith("." + s) for s in source_domains):
+        score += 50
+    elif any(s in domain for s in source_domains):
+        score += 25
+    else:
+        score -= 80
 
-            # Results found but no source match — don't retry, it's not a blocking issue
-            _logger.debug("DDG results found but no '%s' match for '%s'", source, address)
+    combined       = f"{url.lower()} {title.lower()} {snippet.lower()}"
+    address_tokens = _tokenize_address(address)
+    token_hits     = sum(1 for token in address_tokens if token in combined)
+    score += min(token_hits * 6, 30)
+
+    house_number = next((t for t in address_tokens if t.isdigit()), None)
+    if house_number and house_number in path:
+        score += 12
+
+    propertyish_paths = [
+        "/homedetails/",
+        "/realestateandhomes-detail/",
+        "/property/",
+        "/listing/",
+    ]
+    if any(marker in path for marker in propertyish_paths):
+        score += 10
+
+    bad_paths = [
+        "/search",
+        "/agent",
+        "/agents",
+        "/directory",
+        "/profile",
+        "/sitemap",
+    ]
+    if any(marker in path for marker in bad_paths):
+        score -= 25
+
+    if path in ("", "/"):
+        score -= 20
+
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Core Serper fetch  (replaces _ddg_fetch_url_for_property entirely)
+# ---------------------------------------------------------------------------
+def _serper_fetch_url_for_property(address: str, source: str) -> Optional[str]:
+    address = (address or "").strip()
+    source  = (source  or "").strip()
+
+    if not address or not source:
+        return None
+
+    query   = f"{address} {source}"
+    headers = {
+        "X-API-KEY":    SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "q":   query,
+        "num": SERPER_NUM_RESULTS,
+        "gl":  "us",
+        "hl":  "en",
+    }
+
+    _logger.info("Serper request start | address=%s | source=%s", address, source)
+
+    try:
+        response = requests.post(
+            SERPER_API_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=SERPER_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        _logger.info(
+            "Serper response received | address=%s | status=%s | credits_used=%s",
+            address, response.status_code, data.get("credits", "?"),
+        )
+
+        # Serper uses "organic" key (not "organic_results")
+        organic_results: List[Dict] = data.get("organic", [])
+
+        if not organic_results:
+            _logger.warning(
+                "Serper no organic results | address=%s | source=%s", address, source
+            )
             return None
 
-        except requests.exceptions.Timeout:
-            _logger.warning("DDG timeout for '%s' (attempt %d)", address, attempt + 1)
-            time.sleep(random.uniform(3.0, 6.0))
-        except Exception as e:
-            _logger.warning("DDG error for '%s' (attempt %d): %s", address, attempt + 1, e)
-            time.sleep(random.uniform(2.0, 5.0))
-        finally:
-            sess.close()  # ensure connection is fully closed
+        scored = []
+        for result in organic_results:
+            url     = result.get("link", "")
+            title   = result.get("title", "")
+            snippet = result.get("snippet", "")
+
+            if not url:
+                continue
+
+            score = _score_candidate(url, title, snippet, address, source)
+            scored.append((score, url))
+            _logger.debug(
+                "Serper candidate | address=%s | score=%s | url=%s",
+                address, score, url,
+            )
+
+        if not scored:
+            _logger.warning("Serper no scorable candidates | address=%s", address)
+            return None
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_url = scored[0]
+
+        _logger.info(
+            "Serper best candidate | address=%s | score=%s | url=%s",
+            address, best_score, best_url,
+        )
+
+        if best_score >= _MIN_RESULT_SCORE:
+            return best_url
+
+        _logger.warning(
+            "Serper low score | address=%s | source=%s | score=%s | url=%s",
+            address, source, best_score, best_url,
+        )
+        return None
+
+    except ConnectTimeout as exc:
+        _logger.warning("Serper connect timeout | address=%s | error=%s", address, exc)
+    except ReadTimeout as exc:
+        _logger.warning("Serper read timeout | address=%s | error=%s", address, exc)
+    except requests.exceptions.HTTPError as exc:
+        _logger.error("Serper HTTP error | address=%s | error=%s", address, exc)
+    except RequestException as exc:
+        _logger.warning("Serper request exception | address=%s | error=%s", address, exc)
+    except Exception as exc:
+        _logger.exception("Serper unexpected error | address=%s | error=%s", address, exc)
 
     return None
 
 
+# ---------------------------------------------------------------------------
+# Enrich  (per-item delays removed — Serper handles rate limiting server-side)
+# ---------------------------------------------------------------------------
 async def enrich(data: dict) -> dict:
-    """Enrich items with URLs. STRICTLY SEQUENTIAL — one request at a time.
-
-    This avoids burst patterns that trigger DDG anti-bot.
-    Each lookup gets a fresh session, random UA, and human-like delay.
-    """
     items = data.get("clean_sold_comps", []) + data.get("clean_active_listings", [])
-
     results = []
+
+    _logger.info("Starting Serper batch enrichment for %d items", len(items))
+
     for i, item in enumerate(items):
         address = item.get("address")
-        source = item.get("source")
+        source  = item.get("source")
 
         if not address or not source:
-            results.append({**item, "url": None})
+            results.append({**item, "url": None, "source_url": None})
             continue
 
-        # Human-like delay between lookups (not before the first one)
-        if i > 0:
-            delay = random.uniform(12.0, 35.0)
-            await asyncio.sleep(delay)
+        url = await asyncio.to_thread(_serper_fetch_url_for_property, address, source)
 
-        url = await asyncio.to_thread(_ddg_fetch_url_for_property, address, source)
         results.append({**item, "url": url, "source_url": url})
 
         if url:
-            _logger.info("Enriched: %s → %s", address, url)
+            _logger.info("Enriched item %d: %s -> %s", i + 1, address, url)
         else:
-            _logger.debug("No URL found: %s (source=%s)", address, source)
+            _logger.warning("Failed item %d: %s", i + 1, address)
 
     return {"results": results}

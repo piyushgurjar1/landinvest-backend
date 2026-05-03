@@ -10,9 +10,11 @@ class APNReport(Base):
     apn = Column(String, index=True, nullable=False)
     county = Column(String, nullable=True)
     state = Column(String, nullable=True)
+    address = Column(String, nullable=True)
     acreage = Column(Float, nullable=True)
     assessed_value = Column(Float, nullable=True)
-    status = Column(String, default="pending")  # pending, completed, failed
+    status = Column(String, default="queued")  # queued, processing, completed, failed
+    error_message = Column(String, nullable=True)
     report_data = Column(JSON, nullable=True)
     deal_score = Column(Integer, nullable=True)
     bid_ceiling = Column(Float, nullable=True)

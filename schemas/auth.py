@@ -23,6 +23,9 @@ class UserResponse(BaseModel):
     id: int
     email: str
     name: Optional[str] = None
+    role: Optional[str] = "user"
+    is_approved: Optional[bool] = False
 
     class Config:
         from_attributes = True
+

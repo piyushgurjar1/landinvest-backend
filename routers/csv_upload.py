@@ -1,6 +1,7 @@
 import io
 import asyncio
 import logging
+import random
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 import pandas as pd
@@ -118,16 +119,19 @@ def _clean_float(val) -> float | None:
         return None
 
 
-async def _run_batch_analysis(batch_id: int):
-    """Process each APN in a batch sequentially. Each item gets its own DB session.
+BATCH_CHUNK_SIZE = 20
 
-    Design principles:
-    - Fresh DB session per item → no SSL drops killing the batch
-    - Each item is fully isolated → one failure never affects others
-    - Batch always completes → status is always updated to 'completed' or 'completed_with_errors'
+
+async def _run_batch_analysis(batch_id: int):
+    """Process APNs in a batch in chunks of BATCH_CHUNK_SIZE.
+
+    Within each chunk:
+    1. Mark ALL items as 'processing' upfront (so UI shows them all active)
+    2. Fire analysis tasks staggered by 1 second
+    3. Wait for ALL tasks to complete before starting next chunk
     """
 
-    # 1. Load item IDs with a short-lived session (just reading, takes <1s)
+    # 1. Load item IDs with a short-lived session
     db = SessionLocal()
     try:
         batch = db.query(BatchJob).filter(BatchJob.id == batch_id).first()
@@ -147,22 +151,67 @@ async def _run_batch_analysis(batch_id: int):
         _safe_update_batch_status(batch_id, "completed")
         return
 
-    # 2. Process each item with its own DB session
-    for item_id in item_ids:
-        await _process_single_batch_item(batch_id, item_id)
+    # 2. Process in chunks — staggered starts within each chunk
+    total = len(item_ids)
+    for chunk_start in range(0, total, BATCH_CHUNK_SIZE):
+        chunk = item_ids[chunk_start : chunk_start + BATCH_CHUNK_SIZE]
+        chunk_num = (chunk_start // BATCH_CHUNK_SIZE) + 1
+        total_chunks = (total + BATCH_CHUNK_SIZE - 1) // BATCH_CHUNK_SIZE
 
-    # 3. Mark batch as completed (always — even if some items failed)
+        # Cooling delay between chunks (skip before first chunk)
+        if chunk_start > 0:
+            delay = random.uniform(30.0, 60.0)
+            _logger.info(
+                "Batch %s: cooling %.0fs before chunk %d/%d",
+                batch_id, delay, chunk_num, total_chunks,
+            )
+            await asyncio.sleep(delay)
+
+        _logger.info(
+            "Batch %s: launching chunk %d/%d (%d items, staggered 1s apart)",
+            batch_id, chunk_num, total_chunks, len(chunk),
+        )
+
+        # Mark ALL items in this chunk as "processing" upfront
+        db = SessionLocal()
+        try:
+            db.query(BatchItem).filter(BatchItem.id.in_(chunk)).update(
+                {BatchItem.status: "processing"}, synchronize_session=False
+            )
+            db.commit()
+        except Exception as e:
+            _logger.error("Failed to bulk-mark chunk as processing: %s", e)
+        finally:
+            _safe_close(db)
+
+        # Fire analysis tasks with 1-second stagger
+        tasks = []
+        for idx, item_id in enumerate(chunk):
+            if idx > 0:
+                await asyncio.sleep(1.0)
+            tasks.append(asyncio.create_task(
+                _process_single_batch_item(batch_id, item_id, already_marked=True)
+            ))
+
+        # Wait for ALL tasks in this chunk to finish before next chunk
+        await asyncio.gather(*tasks)
+
+        _logger.info("Batch %s: chunk %d/%d complete", batch_id, chunk_num, total_chunks)
+
+    # 3. Mark batch as completed
     _safe_update_batch_status(batch_id, "completed")
 
 
-async def _process_single_batch_item(batch_id: int, item_id: int):
+async def _process_single_batch_item(batch_id: int, item_id: int, already_marked: bool = False):
     """Process one batch item with full isolation. Never raises."""
 
     # Read item data with a fresh session
     db = SessionLocal()
     try:
         item = db.query(BatchItem).filter(BatchItem.id == item_id).first()
-        if not item or item.status != "pending":
+        if not item:
+            return
+        if not already_marked and item.status != "pending":
             return
         # Cache fields before closing session
         apn = item.apn
@@ -171,35 +220,52 @@ async def _process_single_batch_item(batch_id: int, item_id: int):
         latitude = item.latitude
         longitude = item.longitude
         address = item.address
-        # Mark as processing
-        item.status = "processing"
-        db.commit()
+        # Mark as processing if not already
+        if not already_marked:
+            item.status = "processing"
+            db.commit()
     except Exception as e:
         _logger.error("Failed to read/mark batch item %s: %s", item_id, e)
         return
     finally:
         _safe_close(db)
 
-    # Run analysis (NO db session held during this long operation)
+    # Run analysis with retry + exponential backoff (NO db session held)
     report_data = None
     error_message = None
-    try:
-        report_data = await asyncio.wait_for(
-            analyze_apn(
-                apn, county, state,
-                parcel_info=None,
-                latitude=latitude,
-                longitude=longitude,
-                address=address,
-            ),
-            timeout=660.0,
-        )
-    except asyncio.TimeoutError:
-        error_message = "Analysis timed out after 11 minutes"
-        _logger.error("Batch item %s (APN %s) timed out", item_id, apn)
-    except Exception as e:
-        error_message = str(e)[:500]
-        _logger.error("Batch item %s (APN %s) failed: %s", item_id, apn, e)
+    max_attempts = 5
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await asyncio.wait_for(
+                analyze_apn(
+                    apn, county, state,
+                    parcel_info=None,
+                    latitude=latitude,
+                    longitude=longitude,
+                    address=address,
+                ),
+                timeout=2400.0,
+            )
+            # Validate response is not empty/invalid
+            if result and isinstance(result, dict) and result.get("basic_parcel_info"):
+                report_data = result
+                break  # success — exit retry loop
+            else:
+                error_message = f"Empty or invalid analysis response (attempt {attempt}/{max_attempts})"
+                _logger.warning("Batch item %s (APN %s) returned empty/invalid (attempt %d/%d)", item_id, apn, attempt, max_attempts)
+        except asyncio.TimeoutError:
+            error_message = f"Analysis timed out after 40 minutes (attempt {attempt}/{max_attempts})"
+            _logger.error("Batch item %s (APN %s) timed out (attempt %d/%d)", item_id, apn, attempt, max_attempts)
+        except Exception as e:
+            error_message = str(e)[:500]
+            _logger.error("Batch item %s (APN %s) failed (attempt %d/%d): %s", item_id, apn, attempt, max_attempts, e)
+
+        # Retry backoff (skip if last attempt)
+        if attempt < max_attempts:
+            backoff = random.uniform(30, 60) * attempt
+            _logger.info("Retrying batch item %s in %.0fs...", item_id, backoff)
+            await asyncio.sleep(backoff)
 
     # Write results with a FRESH session
     db = SessionLocal()

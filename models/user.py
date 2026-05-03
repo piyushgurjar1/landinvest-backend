@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy import Column, Integer, String, Text, Boolean
 from database import Base
 
 class User(Base):
@@ -8,3 +8,6 @@ class User(Base):
     name = Column(Text, nullable=True)
     email = Column(Text, unique=True, index=True, nullable=False)
     password = Column(String, nullable=False)
+    role = Column(String, default="user")        # "admin" or "user"
+    is_approved = Column(Boolean, default=False)  # requires admin approval
+

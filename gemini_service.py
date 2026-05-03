@@ -48,7 +48,6 @@ from gemini_prompts import (
 _logger = logging.getLogger(__name__)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalar helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -853,7 +852,9 @@ def _compute_cf(stage1: dict[str, Any]) -> tuple[float, list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
-    sold_items   = stage2b.get("clean_sold_comps",      [])
+    from enrich_api import enrich
+
+    sold_items = stage2b.get("clean_sold_comps", [])
     active_items = stage2b.get("clean_active_listings", [])
 
     # Build payload — only items with both address and source
@@ -870,26 +871,18 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
 
     total = len(payload["clean_sold_comps"]) + len(payload["clean_active_listings"])
     if total == 0:
+        _logger.info("No items to enrich.")
         return
 
-    # ✅ Call external Render API via HTTP POST (runs in thread — non-blocking)
-    def _post() -> dict | None:
-        try:
-            res = requests.post(
-                "https://test-9kmq.onrender.com/enrich",
-                json=payload,
-                timeout=400,   # generous timeout — Render cold start + DDG scraping
-            )
-            res.raise_for_status()
-            return res.json()
-        except Exception as exc:
-            _logger.warning("Render enrich API call failed: %s", exc)
-            return None
-
-    data = await asyncio.to_thread(_post)
+    _logger.info(f"Starting enrichment for {total} items...")
+    try:
+        data = await enrich(payload)
+    except Exception as exc:
+        _logger.warning("URL enrichment failed: %s", exc)
+        return
 
     if not data or not isinstance(data, dict):
-        _logger.warning("Render enrich API returned empty or invalid response")
+        _logger.warning("Received invalid data from enrich")
         return
 
     # Build lookup from results
@@ -908,6 +901,7 @@ async def _enrich_source_urls(stage2b: dict[str, Any]) -> None:
         addr = (item.get("address") or "").strip().lower()
         if addr and addr in url_map:
             item["source_url"] = url_map[addr]
+            _logger.info(f"Updated item with URL: {item['source_url']}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1449,9 +1443,9 @@ async def analyze_apn(
 
     # URL enrichment via external API — 60 s total budget
     try:
-        await asyncio.wait_for(_enrich_source_urls(stage2b), timeout=400.0)
+        await _enrich_source_urls(stage2b)
     except asyncio.TimeoutError:
-        _logger.warning("Enrich API timed out — using Gemini URLs only")
+       _logger.warning("Enrich API failed — using Gemini URLs only: %s", exc)
 
     final_report = _build_report(
         stage1=stage1,
