@@ -30,9 +30,6 @@ async def startup_event():
     with engine.connect() as conn:
         try:
             conn.execute(text("ALTER TABLE \"Users-prod\" ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'user'"))
-            conn.execute(text("ALTER TABLE \"Users-prod\" ADD COLUMN IF NOT EXISTS is_approved BOOLEAN DEFAULT FALSE"))
-            # Auto-approve all existing users (prevent lockout)
-            conn.execute(text("UPDATE \"Users-prod\" SET is_approved = TRUE WHERE is_approved IS NULL OR is_approved = FALSE"))
             conn.commit()
             print("✅ User table migration complete")
         except Exception as e:
@@ -40,7 +37,6 @@ async def startup_event():
 
     db = SessionLocal()
     try:
-        # 1. Create / update demo user
         demo_email = os.getenv("DEMO_EMAIL", "demo@gmail.com")
         demo_password = os.getenv("DEMO_PASSWORD", "landinvestai")
         demo_name = os.getenv("DEMO_NAME", "Demo User")
