@@ -30,6 +30,8 @@ async def startup_event():
     with engine.connect() as conn:
         try:
             conn.execute(text("ALTER TABLE \"Users-prod\" ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'user'"))
+            conn.commit()
+            print("✅ User table migration complete")
         except Exception as e:
             print(f"⚠️ User migration note: {e}")
 
@@ -52,6 +54,7 @@ async def startup_event():
             db.commit()
             print(f"✅ Demo admin created: {demo_email} / {demo_password}")
         else:
+            # Ensure demo user is admin and approved
             existing.role = "admin"
             existing.is_approved = True
             db.commit()
