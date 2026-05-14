@@ -4,6 +4,7 @@ Chat router – context-aware, multi-turn conversation about a parcel report.
 
 import os
 import json
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List
@@ -21,7 +22,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHAT_MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+CHAT_MODEL     = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+
+_logger = logging.getLogger("routers.chat")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
@@ -307,7 +310,5 @@ async def chat(
             return ChatResponse(reply=reply_text, needs_search=needs_search)
 
     except Exception as e:
-        import traceback
-        with open("chat_error.txt", "w") as f:
-            f.write(traceback.format_exc())
+        _logger.exception("Chat endpoint failed for report_id=%s: %s", req.report_id, e)
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
